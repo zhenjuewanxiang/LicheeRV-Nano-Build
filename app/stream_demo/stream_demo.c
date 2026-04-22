@@ -30,6 +30,7 @@
 static volatile int            g_exit_flag = 0;
 static SAMPLE_VI_CONFIG_S      g_stViConfig;
 static SAMPLE_INI_CFG_S        g_stIniCfg;
+static uint8_t                 g_sei_fill_value = 0;
 
 static void sig_handle(int signo)
 {
@@ -50,10 +51,74 @@ static uint64_t get_time_us(void)
 	return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000;
 }
 
-/* Concatenate all NAL packs in a VENC stream and send via RTSP. */
+static int is_h265_vcl_nalu(H265E_NALU_TYPE_E enType)
+{
+	return enType == H265E_NALU_BSLICE ||
+	       enType == H265E_NALU_PSLICE ||
+	       enType == H265E_NALU_ISLICE ||
+	       enType == H265E_NALU_IDRSLICE;
+}
+
+static size_t build_h265_prefix_sei(uint8_t *dst, size_t dst_size, uint8_t fill_value)
+{
+	uint8_t rbsp[260];
+	size_t rbsp_len = 0;
+	size_t out = 0;
+	uint32_t now_ms = (uint32_t)(get_time_us() / 1000ULL);
+	int zero_count = 0;
+	int i;
+
+	if (dst_size < 512)
+		return 0;
+
+	/* payload_type = 5 (user_data_unregistered style custom payload) */
+	rbsp[rbsp_len++] = 5;
+	/* payload_size = 256 => 0xFF, 0x01 */
+	rbsp[rbsp_len++] = 0xFF;
+	rbsp[rbsp_len++] = 0x01;
+	rbsp[rbsp_len++] = (uint8_t)((now_ms >> 24) & 0xFF);
+	rbsp[rbsp_len++] = (uint8_t)((now_ms >> 16) & 0xFF);
+	rbsp[rbsp_len++] = (uint8_t)((now_ms >> 8) & 0xFF);
+	rbsp[rbsp_len++] = (uint8_t)(now_ms & 0xFF);
+	for (i = 4; i < 256; i++)
+		rbsp[rbsp_len++] = fill_value;
+	/* rbsp_trailing_bits() */
+	rbsp[rbsp_len++] = 0x80;
+
+	/* Annex-B start code */
+	dst[out++] = 0x00;
+	dst[out++] = 0x00;
+	dst[out++] = 0x00;
+	dst[out++] = 0x01;
+	/* nal_unit_type = 39 (prefix_sei), nuh_layer_id = 0, temporal_id_plus1 = 1 */
+	dst[out++] = 39 << 1;
+	dst[out++] = 0x01;
+
+	for (i = 0; i < (int)rbsp_len; i++) {
+		uint8_t b = rbsp[i];
+
+		if (zero_count >= 2 && b <= 0x03) {
+			dst[out++] = 0x03;
+			zero_count = 0;
+		}
+
+		dst[out++] = b;
+		if (b == 0x00)
+			zero_count++;
+		else
+			zero_count = 0;
+	}
+
+	return out;
+}
+
+/* Send one VENC frame via RTSP and inject one prefix SEI before the first VCL NAL. */
 static void send_venc_stream(VENC_STREAM_S *pstStream)
 {
 	CVI_U32 i;
+	int sei_sent = 0;
+	uint8_t sei_nal[512];
+	size_t sei_len = build_h265_prefix_sei(sei_nal, sizeof(sei_nal), g_sei_fill_value);
 
 	if (pstStream->u32PackCount == 0)
 		return;
@@ -63,9 +128,20 @@ static void send_venc_stream(VENC_STREAM_S *pstStream)
 	for (i = 0; i < pstStream->u32PackCount; i++) {
 		VENC_PACK_S *p = &pstStream->pstPack[i];
 		int len = (int)(p->u32Len - p->u32Offset);
+
+		if (!sei_sent && is_h265_vcl_nalu(p->DataType.enH265EType) && sei_len > 0) {
+			rtsp_send_h265_data(sei_nal, sei_len);
+			sei_sent = 1;
+		}
+
 		if (len > 0)
 			rtsp_send_h265_data(p->pu8Addr + p->u32Offset, (size_t)len);
 	}
+
+	if (!sei_sent && sei_len > 0)
+		rtsp_send_h265_data(sei_nal, sei_len);
+
+	g_sei_fill_value++;
 }
 
 /* ------------------------------------------------------------------ */
