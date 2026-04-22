@@ -1,15 +1,16 @@
 /*
- * stream_demo.c - LicheeRV Nano H.265 RTSP streaming demo
+ * stream_demo.c - LicheeRV Nano H.265 UDP MPEG-TS streaming demo
  *
- * Pipeline: VI (GC4653) -> ISP -> VPSS -> H.265 VENC -> RTSP server
+ * Pipeline: VI (GC4653) -> ISP -> VPSS -> H.265 VENC -> MPEG-TS -> UDP
  * Mode: VI_OFFLINE_VPSS_ONLINE + VPSS_INPUT_ISP (VPSS_MODE_SINGLE)
  *
- * Based on: https://github.com/sipeed/LicheeRV-Nano-Build/issues/20
- *
- * Usage: stream_demo [enc_width enc_height]
+ * Usage: stream_demo [enc_width enc_height [host port]]
  *   Default encode resolution: 2560x1440 (GC4653 max)
- *   Sensor size: read from /mnt/data/sensor_cfg.ini (GC4653 = 2560x1440)
- *   Stream URL: rtsp://<device-ip>:8554/live
+ *   Default target: 192.168.2.255:1234 (UDP broadcast)
+ *   Play on host: ffplay udp://@:1234
+ *              or ffplay udp://192.168.2.18:1234  (direct)
+ *
+ * Note: For unicast, run:  stream_demo 2560 1440 192.168.2.X 1234
  */
 
 #include <stdio.h>
@@ -19,9 +20,13 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/select.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include "sample_comm.h"
-#include "rtsp-server.h"
+#include "mpeg-ts.h"
+#include "mpeg-proto.h"
 
 /* ------------------------------------------------------------------ */
 /* Global state                                                        */
@@ -30,6 +35,13 @@
 static volatile int            g_exit_flag = 0;
 static SAMPLE_VI_CONFIG_S      g_stViConfig;
 static SAMPLE_INI_CFG_S        g_stIniCfg;
+
+/* MPEG-TS / UDP output state */
+static int                     g_udp_sock       = -1;
+static struct sockaddr_in      g_udp_dst;
+static void                   *g_ts_muxer       = NULL;
+static int                     g_ts_vid_stream  = -1;
+static int64_t                 g_ts_pts         = 0;   /* 90 kHz clock */
 
 static void sig_handle(int signo)
 {
@@ -50,22 +62,128 @@ static uint64_t get_time_us(void)
 	return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000;
 }
 
-/* Concatenate all NAL packs in a VENC stream and send via RTSP. */
+/* TS alloc/free/write callbacks required by libmpeg. */
+static void *ts_alloc_cb(void *param, size_t bytes)
+{
+	(void)param;
+	return malloc(bytes);
+}
+
+static void ts_free_cb(void *param, void *packet)
+{
+	(void)param;
+	free(packet);
+}
+
+static int ts_write_cb(void *param, const void *data, size_t bytes)
+{
+	(void)param;
+	sendto(g_udp_sock, data, bytes, 0,
+	       (struct sockaddr *)&g_udp_dst, sizeof(g_udp_dst));
+	return 0;
+}
+
+/* Initialise UDP socket and MPEG-TS muxer. */
+static int ts_udp_init(const char *host, int port)
+{
+	static const struct mpeg_ts_func_t ts_func = { ts_alloc_cb, ts_free_cb, ts_write_cb };
+	int on = 1;
+
+	g_udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+	if (g_udp_sock < 0) {
+		perror("[stream_demo] socket");
+		return -1;
+	}
+	/* Allow broadcast addresses */
+	setsockopt(g_udp_sock, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on));
+
+	memset(&g_udp_dst, 0, sizeof(g_udp_dst));
+	g_udp_dst.sin_family = AF_INET;
+	g_udp_dst.sin_port   = htons((uint16_t)port);
+	if (inet_aton(host, &g_udp_dst.sin_addr) == 0) {
+		fprintf(stderr, "[stream_demo] invalid host: %s\n", host);
+		close(g_udp_sock);
+		g_udp_sock = -1;
+		return -1;
+	}
+
+	g_ts_muxer = mpeg_ts_create(&ts_func, NULL);
+	if (!g_ts_muxer) {
+		fprintf(stderr, "[stream_demo] mpeg_ts_create failed\n");
+		close(g_udp_sock);
+		g_udp_sock = -1;
+		return -1;
+	}
+
+	g_ts_vid_stream = mpeg_ts_add_stream(g_ts_muxer, PSI_STREAM_H265, NULL, 0);
+	if (g_ts_vid_stream <= 0) {
+		fprintf(stderr, "[stream_demo] mpeg_ts_add_stream failed\n");
+		mpeg_ts_destroy(g_ts_muxer);
+		g_ts_muxer = NULL;
+		close(g_udp_sock);
+		g_udp_sock = -1;
+		return -1;
+	}
+
+	return 0;
+}
+
+static void ts_udp_deinit(void)
+{
+	if (g_ts_muxer) {
+		mpeg_ts_destroy(g_ts_muxer);
+		g_ts_muxer = NULL;
+	}
+	if (g_udp_sock >= 0) {
+		close(g_udp_sock);
+		g_udp_sock = -1;
+	}
+}
+
+/*
+ * Mux one VENC frame into MPEG-TS and send via UDP.
+ * All packs are concatenated into one Annex-B access unit,
+ * which is what mpeg_ts_write() expects.
+ */
 static void send_venc_stream(VENC_STREAM_S *pstStream)
 {
-	CVI_U32 i;
+	CVI_U32  i;
+	size_t   total = 0;
+	size_t   off   = 0;
+	int      is_idr = 0;
+	uint8_t *buf;
 
 	if (pstStream->u32PackCount == 0)
 		return;
 
-	/* Send each NAL unit separately so the RTSP H265 source sees
-	 * one NAL per call (start-code Annex-B data per pack). */
+	/* Calculate total size and detect IDR */
 	for (i = 0; i < pstStream->u32PackCount; i++) {
 		VENC_PACK_S *p = &pstStream->pstPack[i];
-		int len = (int)(p->u32Len - p->u32Offset);
-		if (len > 0)
-			rtsp_send_h265_data(p->pu8Addr + p->u32Offset, (size_t)len);
+		total += (size_t)(p->u32Len - p->u32Offset);
+		if (p->DataType.enH265EType == H265E_NALU_IDRSLICE)
+			is_idr = 1;
 	}
+
+	buf = (uint8_t *)malloc(total);
+	if (!buf)
+		return;
+
+	/* Copy all NALs (each already has Annex-B start code from VENC) */
+	for (i = 0; i < pstStream->u32PackCount; i++) {
+		VENC_PACK_S *p = &pstStream->pstPack[i];
+		size_t len = (size_t)(p->u32Len - p->u32Offset);
+		memcpy(buf + off, p->pu8Addr + p->u32Offset, len);
+		off += len;
+	}
+
+	/* flags: 0x0001 = IDR/random-access point */
+	mpeg_ts_write(g_ts_muxer, g_ts_vid_stream,
+	              is_idr ? 0x0001 : 0,
+	              g_ts_pts, g_ts_pts,
+	              buf, total);
+	g_ts_pts += 3000; /* 90000 Hz / 30 fps */
+
+	free(buf);
 }
 
 /* ------------------------------------------------------------------ */
@@ -297,19 +415,29 @@ static void sys_venc_deinit(void)
 
 int main(int argc, char *argv[])
 {
-	int enc_w = 2560;
-	int enc_h = 1440;
-	int ret   = 0;
+	int         enc_w = 2560;
+	int         enc_h = 1440;
+	const char *host  = "192.168.2.255";
+	int         port  = 1234;
+	int         ret   = 0;
 
-	if (argc == 3) {
+	if (argc == 3 || argc == 5) {
 		enc_w = atoi(argv[1]);
 		enc_h = atoi(argv[2]);
 		if (enc_w <= 0 || enc_h <= 0) {
-			fprintf(stderr, "Usage: %s [enc_width enc_height]\n", argv[0]);
+			fprintf(stderr, "Usage: %s [enc_w enc_h [host port]]\n", argv[0]);
 			return 1;
 		}
+		if (argc == 5) {
+			host = argv[3];
+			port = atoi(argv[4]);
+			if (port <= 0 || port > 65535) {
+				fprintf(stderr, "Invalid port: %s\n", argv[4]);
+				return 1;
+			}
+		}
 	} else if (argc != 1) {
-		fprintf(stderr, "Usage: %s [enc_width enc_height]\n", argv[0]);
+		fprintf(stderr, "Usage: %s [enc_w enc_h [host port]]\n", argv[0]);
 		return 1;
 	}
 
@@ -317,28 +445,22 @@ int main(int argc, char *argv[])
 	signal(SIGTERM, sig_handle);
 	signal(SIGPIPE, SIG_IGN);
 
-	printf("[stream_demo] starting, encode %dx%d H265\n", enc_w, enc_h);
+	printf("[stream_demo] starting, encode %dx%d H265 -> udp://%s:%d\n",
+	       enc_w, enc_h, host, port);
+	printf("[stream_demo] play with: ffplay udp://@:%d\n", port);
 	fflush(stdout);
 
-	/* 1. Start RTSP server */
-	if (rtsp_server_init(NULL, 8554) != 0) {
-		fprintf(stderr, "[stream_demo] rtsp_server_init failed\n");
+	/* 1. Init UDP + MPEG-TS muxer */
+	if (ts_udp_init(host, port) != 0) {
+		fprintf(stderr, "[stream_demo] ts_udp_init failed\n");
 		return 1;
 	}
-	if (rtsp_server_start() != 0) {
-		fprintf(stderr, "[stream_demo] rtsp_server_start failed\n");
-		rtsp_server_deinit();
-		return 1;
-	}
-	printf("[stream_demo] RTSP URL: rtsp://%s:%d/live\n",
-	       rtsp_get_server_ip(), rtsp_get_server_port());
-	fflush(stdout);
 
 	/* 2. Init VI + VPSS */
 	if (sys_vi_init(enc_w, enc_h) != 0) {
 		fprintf(stderr, "[stream_demo] sys_vi_init failed\n");
 		ret = 1;
-		goto err_rtsp;
+		goto err_ts;
 	}
 
 	/* 3. Init VENC H265 */
@@ -427,7 +549,7 @@ err_venc:
 	sys_venc_deinit();
 err_vi:
 	sys_vi_deinit();
-err_rtsp:
-	rtsp_server_deinit();
+err_ts:
+	ts_udp_deinit();
 	return ret;
 }
