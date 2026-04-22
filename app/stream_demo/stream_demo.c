@@ -54,30 +54,18 @@ static uint64_t get_time_us(void)
 static void send_venc_stream(VENC_STREAM_S *pstStream)
 {
 	CVI_U32 i;
-	int     total = 0;
 
 	if (pstStream->u32PackCount == 0)
 		return;
 
-	for (i = 0; i < pstStream->u32PackCount; i++)
-		total += (int)(pstStream->pstPack[i].u32Len - pstStream->pstPack[i].u32Offset);
-
-	uint8_t *buf = (uint8_t *)malloc((size_t)total);
-	if (!buf) {
-		fprintf(stderr, "[stream_demo] malloc(%d) for NAL concat failed\n", total);
-		return;
-	}
-
-	int off = 0;
+	/* Send each NAL unit separately so the RTSP H265 source sees
+	 * one NAL per call (start-code Annex-B data per pack). */
 	for (i = 0; i < pstStream->u32PackCount; i++) {
 		VENC_PACK_S *p = &pstStream->pstPack[i];
 		int len = (int)(p->u32Len - p->u32Offset);
-		memcpy(buf + off, p->pu8Addr + p->u32Offset, (size_t)len);
-		off += len;
+		if (len > 0)
+			rtsp_send_h265_data(p->pu8Addr + p->u32Offset, (size_t)len);
 	}
-
-	rtsp_send_h265_data(buf, (size_t)total);
-	free(buf);
 }
 
 /* ------------------------------------------------------------------ */
@@ -253,9 +241,9 @@ static int sys_venc_h265_init(int enc_w, int enc_h)
 	stChnAttr.stVencAttr.bByFrame        = CVI_TRUE;
 	stChnAttr.stVencAttr.u32PicWidth     = (CVI_U32)enc_w;
 	stChnAttr.stVencAttr.u32PicHeight    = (CVI_U32)enc_h;
-	stChnAttr.stVencAttr.bSingleCore     = CVI_TRUE;
-	stChnAttr.stVencAttr.bEsBufQueueEn   = CVI_FALSE;
-	stChnAttr.stVencAttr.bIsoSendFrmEn   = CVI_FALSE;
+	stChnAttr.stVencAttr.bSingleCore     = CVI_FALSE;
+	stChnAttr.stVencAttr.bEsBufQueueEn   = CVI_TRUE;
+	stChnAttr.stVencAttr.bIsoSendFrmEn   = CVI_TRUE;
 
 	stChnAttr.stRcAttr.enRcMode                  = VENC_RC_MODE_H265CBR;
 	stChnAttr.stRcAttr.stH265Cbr.u32Gop          = 30;
