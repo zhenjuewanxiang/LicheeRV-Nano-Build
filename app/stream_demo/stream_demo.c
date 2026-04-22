@@ -43,6 +43,13 @@ static void                   *g_ts_muxer       = NULL;
 static int                     g_ts_vid_stream  = -1;
 static int64_t                 g_ts_pts         = 0;   /* 90 kHz clock */
 
+/* UDP send batching: accumulate 7 x 188-byte TS packets per datagram
+ * (= 1316 bytes, well under Ethernet MTU).  Avoids flooding the
+ * receiver socket buffer with hundreds of tiny datagrams per frame. */
+#define TS_BATCH_SIZE  (188 * 7)
+static uint8_t  g_ts_batch[TS_BATCH_SIZE];
+static int      g_ts_batch_len = 0;
+
 static void sig_handle(int signo)
 {
 	(void)signo;
@@ -78,9 +85,25 @@ static void ts_free_cb(void *param, void *packet)
 static int ts_write_cb(void *param, const void *data, size_t bytes)
 {
 	(void)param;
-	sendto(g_udp_sock, data, bytes, 0,
-	       (struct sockaddr *)&g_udp_dst, sizeof(g_udp_dst));
+	/* Buffer packets; flush when the batch buffer is full. */
+	if (g_ts_batch_len + (int)bytes > TS_BATCH_SIZE) {
+		sendto(g_udp_sock, g_ts_batch, g_ts_batch_len, 0,
+		       (struct sockaddr *)&g_udp_dst, sizeof(g_udp_dst));
+		g_ts_batch_len = 0;
+	}
+	memcpy(g_ts_batch + g_ts_batch_len, data, bytes);
+	g_ts_batch_len += (int)bytes;
 	return 0;
+}
+
+/* Flush any buffered TS packets (call at end of each access unit). */
+static void ts_flush(void)
+{
+	if (g_ts_batch_len > 0) {
+		sendto(g_udp_sock, g_ts_batch, g_ts_batch_len, 0,
+		       (struct sockaddr *)&g_udp_dst, sizeof(g_udp_dst));
+		g_ts_batch_len = 0;
+	}
 }
 
 /* Initialise UDP socket and MPEG-TS muxer. */
@@ -130,6 +153,7 @@ static int ts_udp_init(const char *host, int port)
 
 static void ts_udp_deinit(void)
 {
+	ts_flush();
 	if (g_ts_muxer) {
 		mpeg_ts_destroy(g_ts_muxer);
 		g_ts_muxer = NULL;
@@ -176,11 +200,15 @@ static void send_venc_stream(VENC_STREAM_S *pstStream)
 		off += len;
 	}
 
-	/* flags: 0x0001 = IDR/random-access point */
+	/* flags: 0x0001 = IDR/random-access, 0x8000 = insert AUD NAL (required
+	 * by VLC / most decoders to locate frame boundaries in the TS stream). */
 	mpeg_ts_write(g_ts_muxer, g_ts_vid_stream,
-	              is_idr ? 0x0001 : 0,
+	              0x8000 | (is_idr ? 0x0001 : 0),
 	              g_ts_pts, g_ts_pts,
 	              buf, total);
+	/* Flush leftover TS packets for this frame immediately so the
+	 * receiver always gets a complete access unit per flush. */
+	ts_flush();
 	g_ts_pts += 3000; /* 90000 Hz / 30 fps */
 
 	free(buf);
