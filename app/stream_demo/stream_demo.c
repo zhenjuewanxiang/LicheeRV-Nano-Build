@@ -7,7 +7,7 @@
  * Based on: https://github.com/sipeed/LicheeRV-Nano-Build/issues/20
  *
  * Usage: stream_demo [enc_width enc_height]
- *   Default encode resolution: 1280x720
+ *   Default encode resolution: 2560x1440 (GC4653 max)
  *   Sensor size: read from /mnt/data/sensor_cfg.ini (GC4653 = 2560x1440)
  *   Stream URL: rtsp://<device-ip>:8554/live
  */
@@ -182,7 +182,7 @@ static int sys_vi_init(int enc_w, int enc_h)
 		stChnAttr[0].stFrameRate.s32DstFrameRate = 30;
 		stChnAttr[0].u32Depth                    = 0;
 		stChnAttr[0].bMirror                     = CVI_FALSE;
-		stChnAttr[0].bFlip                       = CVI_FALSE;
+		stChnAttr[0].bFlip                       = CVI_TRUE;
 		stChnAttr[0].stAspectRatio.enMode        = ASPECT_RATIO_NONE;
 		stChnAttr[0].stNormalize.bEnable         = CVI_FALSE;
 
@@ -297,8 +297,8 @@ static void sys_venc_deinit(void)
 
 int main(int argc, char *argv[])
 {
-	int enc_w = 1280;
-	int enc_h = 720;
+	int enc_w = 2560;
+	int enc_h = 1440;
 	int ret   = 0;
 
 	if (argc == 3) {
