@@ -19,6 +19,8 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/select.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 #include "sample_comm.h"
 #include "rtsp-server.h"
@@ -31,6 +33,15 @@ static volatile int            g_exit_flag = 0;
 static SAMPLE_VI_CONFIG_S      g_stViConfig;
 static SAMPLE_INI_CFG_S        g_stIniCfg;
 static uint8_t                 g_sei_fill_value = 0;
+
+#define REC_SEG_SECONDS 10
+#define REC_SEG_COUNT   18
+#define REC_DIR         "/tmp/stream_demo_segments"
+
+static FILE                   *g_rec_fp = NULL;
+static int                     g_rec_index = -1;
+static uint64_t                g_rec_seg_start_us = 0;
+static int                     g_rec_need_rotate = 0;
 
 static void sig_handle(int signo)
 {
@@ -57,6 +68,50 @@ static int is_h265_vcl_nalu(H265E_NALU_TYPE_E enType)
 	       enType == H265E_NALU_PSLICE ||
 	       enType == H265E_NALU_ISLICE ||
 	       enType == H265E_NALU_IDRSLICE;
+}
+
+static int is_h265_idr_nalu(H265E_NALU_TYPE_E enType)
+{
+	return enType == H265E_NALU_IDRSLICE;
+}
+
+static int rec_open_segment(int index)
+{
+	char path[256];
+
+	if (mkdir(REC_DIR, 0777) != 0 && errno != EEXIST) {
+		perror("[stream_demo] mkdir record dir");
+		return -1;
+	}
+
+	snprintf(path, sizeof(path), "%s/seg_%02d.h265", REC_DIR, index);
+
+	if (g_rec_fp) {
+		fclose(g_rec_fp);
+		g_rec_fp = NULL;
+	}
+
+	g_rec_fp = fopen(path, "wb");
+	if (!g_rec_fp) {
+		perror("[stream_demo] fopen segment");
+		return -1;
+	}
+
+	g_rec_index = index;
+	g_rec_seg_start_us = get_time_us();
+	g_rec_need_rotate = 0;
+
+	printf("[stream_demo] recording segment: %s\n", path);
+	fflush(stdout);
+	return 0;
+}
+
+static void rec_deinit(void)
+{
+	if (g_rec_fp) {
+		fclose(g_rec_fp);
+		g_rec_fp = NULL;
+	}
 }
 
 static size_t build_h265_prefix_sei(uint8_t *dst, size_t dst_size, uint8_t fill_value)
@@ -117,11 +172,37 @@ static void send_venc_stream(VENC_STREAM_S *pstStream)
 {
 	CVI_U32 i;
 	int sei_sent = 0;
+	int frame_has_idr = 0;
 	uint8_t sei_nal[512];
 	size_t sei_len = build_h265_prefix_sei(sei_nal, sizeof(sei_nal), g_sei_fill_value);
+	uint64_t now_us = get_time_us();
 
 	if (pstStream->u32PackCount == 0)
 		return;
+
+	for (i = 0; i < pstStream->u32PackCount; i++) {
+		if (is_h265_idr_nalu(pstStream->pstPack[i].DataType.enH265EType)) {
+			frame_has_idr = 1;
+			break;
+		}
+	}
+
+	if (!g_rec_fp) {
+		if (rec_open_segment(0) != 0)
+			return;
+	}
+
+	if (!g_rec_need_rotate &&
+	    now_us - g_rec_seg_start_us >= (uint64_t)REC_SEG_SECONDS * 1000000ULL) {
+		g_rec_need_rotate = 1;
+	}
+
+	/* Rotate only on IDR boundary to keep each segment independently decodable. */
+	if (g_rec_need_rotate && frame_has_idr) {
+		int next_index = (g_rec_index + 1) % REC_SEG_COUNT;
+		if (rec_open_segment(next_index) != 0)
+			return;
+	}
 
 	/* Send each NAL unit separately so the RTSP H265 source sees
 	 * one NAL per call (start-code Annex-B data per pack). */
@@ -131,15 +212,26 @@ static void send_venc_stream(VENC_STREAM_S *pstStream)
 
 		if (!sei_sent && is_h265_vcl_nalu(p->DataType.enH265EType) && sei_len > 0) {
 			rtsp_send_h265_data(sei_nal, sei_len);
+			if (g_rec_fp)
+				fwrite(sei_nal, 1, sei_len, g_rec_fp);
 			sei_sent = 1;
 		}
 
-		if (len > 0)
+		if (len > 0) {
 			rtsp_send_h265_data(p->pu8Addr + p->u32Offset, (size_t)len);
+			if (g_rec_fp)
+				fwrite(p->pu8Addr + p->u32Offset, 1, (size_t)len, g_rec_fp);
+		}
 	}
 
-	if (!sei_sent && sei_len > 0)
+	if (!sei_sent && sei_len > 0) {
 		rtsp_send_h265_data(sei_nal, sei_len);
+		if (g_rec_fp)
+			fwrite(sei_nal, 1, sei_len, g_rec_fp);
+	}
+
+	if (g_rec_fp)
+		fflush(g_rec_fp);
 
 	g_sei_fill_value++;
 }
@@ -504,6 +596,7 @@ err_venc:
 err_vi:
 	sys_vi_deinit();
 err_rtsp:
+	rec_deinit();
 	rtsp_server_deinit();
 	return ret;
 }
