@@ -326,7 +326,7 @@ static int sys_venc_h265_init(int enc_w, int enc_h)
 	stChnAttr.stRcAttr.stH265Cbr.u32StatTime     = 1;
 	stChnAttr.stRcAttr.stH265Cbr.u32SrcFrameRate = 30;
 	stChnAttr.stRcAttr.stH265Cbr.fr32DstFrameRate = 30;
-	stChnAttr.stRcAttr.stH265Cbr.u32BitRate      = 4096;  /* 4 Mbps */
+	stChnAttr.stRcAttr.stH265Cbr.u32BitRate      = 8192;  /* 8 Mbps */
 	stChnAttr.stRcAttr.stH265Cbr.bVariFpsEn      = CVI_FALSE;
 
 	stChnAttr.stGopAttr.enGopMode            = VENC_GOPMODE_NORMALP;
