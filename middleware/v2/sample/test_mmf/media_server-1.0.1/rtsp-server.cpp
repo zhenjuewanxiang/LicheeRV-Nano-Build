@@ -203,6 +203,10 @@ static int rtsp_onsetup(void* /*ptr*/, rtsp_server_t* rtsp, const char* uri, con
 	{
 		filename = filename.c_str() + 6;
 	}
+	else if (strstartswith(filename.c_str(), "/live"))
+	{
+		filename = filename.c_str() + 5;
+	}
 	else if (strstartswith(filename.c_str(), "/vod/"))
 	{
 		filename = path::join(s_workdir, filename.c_str() + 5);
