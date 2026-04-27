@@ -16,6 +16,7 @@ TARGET := stream_demo
 # Source files
 SRCS := \
 	$(SDIR)/stream_demo.c \
+	$(SDIR)/imu.c \
 	$(MEDIA_SERVER)/libmov/test/mov-file-buffer.c
 
 # http-parser compiled separately with NDEBUG to disable asserts
