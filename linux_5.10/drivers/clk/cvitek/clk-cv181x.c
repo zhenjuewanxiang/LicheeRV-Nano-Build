@@ -2815,6 +2815,18 @@ static void __init cvi_clk_init(struct device_node *node)
 		return;
 	}
 
+	/*
+	 * Switch clk_cam0_200 (parent of all UART clocks) from osc (25 MHz)
+	 * to clk_disppll/7 (~169.7 MHz) so that 460800 baud has <0.1% error.
+	 * REG_DIV_CLK_CAM0_200 (0x0A8): bits[19:16]=div, bits[9:8]=src_sel,
+	 * bit[3]=1 means driver reads divider from register (not initval).
+	 * clk_cam0_200 has no mux[1] (clk_sel), so parent_idx = src_sel + 1.
+	 * parents = {"osc"[0], "osc"[1], "clk_disppll"[2]}
+	 * To select clk_disppll (index 2): src_sel=1 => bits[9:8]=0x1.
+	 * div=7 => 1188/7 = 169.7 MHz.
+	 */
+	writel(0x00070109, clk_data->base + REG_DIV_CLK_CAM0_200);
+
 	cv181x_clk_register_plls(cv181x_pll_clks,
 			       ARRAY_SIZE(cv181x_pll_clks),
 			       clk_data);
