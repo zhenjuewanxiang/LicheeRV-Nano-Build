@@ -21,6 +21,7 @@
 #include <errno.h>
 #include <termios.h>
 
+#include "imu.h"
 #include "sample_comm.h"
 #include "rtsp-server.h"
 
@@ -32,6 +33,7 @@ static volatile int            g_exit_flag = 0;
 static SAMPLE_VI_CONFIG_S      g_stViConfig;
 static SAMPLE_INI_CFG_S        g_stIniCfg;
 static uint8_t                 g_sei_fill_value = 0;
+static imu_parser_t           *g_imu_parser = NULL;
 
 static void sig_handle(int signo)
 {
@@ -50,6 +52,44 @@ static uint64_t get_time_us(void)
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000;
+}
+
+/**
+ * @brief Print decoded imu tilt packet.
+ * @param t_pkt Input imu packet.
+ * @param t_user User context pointer.
+ * @return None.
+ */
+static void imu_packet_print(const imu_packet_t *t_pkt, void *t_user)
+{
+	imu_tilt_t tilt;
+
+	(void)t_user;
+
+	if (!t_pkt)
+		return;
+
+	if (imu_decode_tilt(t_pkt, &tilt) != 0)
+		return;
+
+	printf("[imu] time=%.3f status=%u\n",
+	       tilt.system_time, tilt.status);
+	printf("[imu] gyro=%.4f %.4f %.4f deg/s\n",
+	       tilt.gyro[0], tilt.gyro[1], tilt.gyro[2]);
+	if (tilt.has_accel) {
+		printf("[imu] accel=%.4f %.4f %.4f m/s^2\n",
+		       tilt.accel[0], tilt.accel[1], tilt.accel[2]);
+	}
+	printf("[imu] euler pitch=%.4f roll=%.4f yaw=%.4f deg\n",
+	       tilt.pitch, tilt.roll, tilt.yaw);
+	if (tilt.has_quat) {
+		printf("[imu] temp=%.3f C quat=%.6f %.6f %.6f %.6f\n",
+		       tilt.temperature,
+		       tilt.quat[0], tilt.quat[1], tilt.quat[2], tilt.quat[3]);
+	} else {
+		printf("[imu] temp=%.3f C\n", tilt.temperature);
+	}
+	fflush(stdout);
 }
 
 static int uart1_init(int *t_uart_fd)
@@ -88,6 +128,14 @@ static int uart1_init(int *t_uart_fd)
 		return -1;
 	}
 
+	if (!g_imu_parser) {
+		g_imu_parser = imu_parser_create(imu_packet_print, NULL);
+		if (!g_imu_parser) {
+			close(fd);
+			return -1;
+		}
+	}
+
 	*t_uart_fd = fd;
 	return 0;
 }
@@ -96,6 +144,11 @@ static void uart1_deinit(int t_uart_fd)
 {
 	if (t_uart_fd >= 0)
 		close(t_uart_fd);
+
+	if (g_imu_parser) {
+		imu_parser_destroy(g_imu_parser);
+		g_imu_parser = NULL;
+	}
 }
 
 static void uart1_handle_rx_tx(int t_uart_fd)
@@ -113,11 +166,9 @@ static void uart1_handle_rx_tx(int t_uart_fd)
 		return;
 	}
 
-	printf("[stream_demo] uart1 rx %zd bytes:", rx_len);
-	for (ssize_t i = 0; i < rx_len; i++)
-		printf(" %02X", (unsigned char)rx_buf[i]);
-	printf("\n");
-	fflush(stdout);
+	printf("[stream_demo] uart1 rx %zd bytes\r\n", rx_len);
+	if (g_imu_parser)
+		imu_parser_feed(g_imu_parser, (const uint8_t *)rx_buf, (size_t)rx_len);
 }
 
 static int is_h265_vcl_nalu(H265E_NALU_TYPE_E enType)

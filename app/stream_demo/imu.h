@@ -10,15 +10,19 @@
 
 /* known message class / id */
 #define IMU_CLASS_TILT  0x2Cu
+#define IMU_CLASS_TILT_COMPACT  0x21u
 #define IMU_ID_TILT     0xB2u
 
 /* tilt payload length */
 #define IMU_TILT_PAYLOAD_LEN  65u
+#define IMU_TILT_COMPACT_PAYLOAD_LEN  37u
 
 /* parsed tilt/imu measurement */
 typedef struct {
     double   system_time;  /* seconds */
     uint8_t  status;
+    uint8_t  has_accel;
+    uint8_t  has_quat;
     float    gyro[3];      /* deg/s  [x, y, z] */
     float    accel[3];     /* m/s^2  [x, y, z] */
     float    pitch;        /* deg */

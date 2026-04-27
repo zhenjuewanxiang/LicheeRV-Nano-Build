@@ -230,29 +230,47 @@ int imu_decode_tilt(const imu_packet_t *pkt, imu_tilt_t *out)
 {
     if (!pkt || !out)
         return -1;
-    if (pkt->cls != IMU_CLASS_TILT || pkt->id != IMU_ID_TILT)
+    if (pkt->id != IMU_ID_TILT)
         return -1;
-    if (pkt->length != IMU_TILT_PAYLOAD_LEN)
+    if (pkt->cls != IMU_CLASS_TILT && pkt->cls != IMU_CLASS_TILT_COMPACT)
         return -1;
+    if (pkt->length != IMU_TILT_PAYLOAD_LEN && pkt->length != IMU_TILT_COMPACT_PAYLOAD_LEN)
+        return -1;
+
+    memset(out, 0, sizeof(*out));
 
     const uint8_t *d = pkt->payload;
 
     out->system_time  = load_f64_le(d);      d += 8;
     out->status       = *d++;
+    out->has_accel    = 0;
+    out->has_quat     = 0;
     out->gyro[0]      = load_f32_le(d);      d += 4;
     out->gyro[1]      = load_f32_le(d);      d += 4;
     out->gyro[2]      = load_f32_le(d);      d += 4;
-    out->accel[0]     = load_f32_le(d);      d += 4;
-    out->accel[1]     = load_f32_le(d);      d += 4;
-    out->accel[2]     = load_f32_le(d);      d += 4;
-    out->pitch        = load_f32_le(d);      d += 4;
-    out->roll         = load_f32_le(d);      d += 4;
-    out->yaw          = load_f32_le(d);      d += 4;
-    out->temperature  = load_f32_le(d);      d += 4;
-    out->quat[0]      = load_f32_le(d);      d += 4;
-    out->quat[1]      = load_f32_le(d);      d += 4;
-    out->quat[2]      = load_f32_le(d);      d += 4;
-    out->quat[3]      = load_f32_le(d);
+
+    if (pkt->cls == IMU_CLASS_TILT && pkt->length == IMU_TILT_PAYLOAD_LEN) {
+        out->has_accel    = 1;
+        out->has_quat     = 1;
+        out->accel[0]     = load_f32_le(d);      d += 4;
+        out->accel[1]     = load_f32_le(d);      d += 4;
+        out->accel[2]     = load_f32_le(d);      d += 4;
+        out->pitch        = load_f32_le(d);      d += 4;
+        out->roll         = load_f32_le(d);      d += 4;
+        out->yaw          = load_f32_le(d);      d += 4;
+        out->temperature  = load_f32_le(d);      d += 4;
+        out->quat[0]      = load_f32_le(d);      d += 4;
+        out->quat[1]      = load_f32_le(d);      d += 4;
+        out->quat[2]      = load_f32_le(d);      d += 4;
+        out->quat[3]      = load_f32_le(d);
+    } else if (pkt->cls == IMU_CLASS_TILT_COMPACT && pkt->length == IMU_TILT_COMPACT_PAYLOAD_LEN) {
+        out->pitch        = load_f32_le(d);      d += 4;
+        out->roll         = load_f32_le(d);      d += 4;
+        out->yaw          = load_f32_le(d);      d += 4;
+        out->temperature  = load_f32_le(d);
+    } else {
+        return -1;
+    }
 
     return 0;
 }
