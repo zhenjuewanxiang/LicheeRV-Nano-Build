@@ -17,6 +17,9 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/select.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <termios.h>
 
 #include "sample_comm.h"
 #include "rtsp-server.h"
@@ -47,6 +50,74 @@ static uint64_t get_time_us(void)
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000;
+}
+
+static int uart1_init(int *t_uart_fd)
+{
+	int fd;
+	struct termios tty;
+
+	if (!t_uart_fd)
+		return -1;
+
+	fd = open("/dev/ttyS1", O_RDWR | O_NOCTTY | O_NONBLOCK);
+	if (fd < 0)
+		return -1;
+
+	if (tcgetattr(fd, &tty) != 0) {
+		close(fd);
+		return -1;
+	}
+
+	cfmakeraw(&tty);
+	cfsetispeed(&tty, B460800);
+	cfsetospeed(&tty, B460800);
+	tty.c_cflag |= (CLOCAL | CREAD);
+	tty.c_cflag &= ~CSTOPB;         /* 1 stop bit */
+	tty.c_cflag &= ~PARENB;         /* no parity */
+	tty.c_cflag &= ~CRTSCTS;        /* no HW flow control */
+	tty.c_cflag &= ~CSIZE;
+	tty.c_cflag |= CS8;             /* 8 data bits */
+	tty.c_iflag &= ~(IXON | IXOFF | IXANY); /* no SW flow control */
+	tty.c_iflag |= IGNPAR | IGNBRK; /* silently discard framing/parity errors */
+	tty.c_cc[VMIN] = 0;
+	tty.c_cc[VTIME] = 0;
+
+	if (tcsetattr(fd, TCSANOW, &tty) != 0) {
+		close(fd);
+		return -1;
+	}
+
+	*t_uart_fd = fd;
+	return 0;
+}
+
+static void uart1_deinit(int t_uart_fd)
+{
+	if (t_uart_fd >= 0)
+		close(t_uart_fd);
+}
+
+static void uart1_handle_rx_tx(int t_uart_fd)
+{
+	char rx_buf[256];
+	ssize_t rx_len;
+
+	if (t_uart_fd < 0)
+		return;
+
+	rx_len = read(t_uart_fd, rx_buf, sizeof(rx_buf));
+	if (rx_len <= 0) {
+		if (rx_len < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+			perror("[stream_demo] uart1 read");
+		return;
+	}
+
+	printf("[stream_demo] uart1 rx %zd bytes:", rx_len);
+	for (ssize_t i = 0; i < rx_len; i++)
+		printf(" %02X", (unsigned char)rx_buf[i]);
+	printf("\n");
+	fflush(stdout);
 }
 
 static int is_h265_vcl_nalu(H265E_NALU_TYPE_E enType)
@@ -426,6 +497,7 @@ int main(int argc, char *argv[])
 	{
 		VENC_CHN       VencChn  = 0;
 		CVI_S32        venc_fd  = CVI_VENC_GetFd(VencChn);
+		int            uart_fd  = -1;
 		uint64_t       frame_count = 0;
 		uint64_t       last_us    = get_time_us();
 
@@ -435,6 +507,11 @@ int main(int argc, char *argv[])
 			goto err_venc;
 		}
 
+		if (uart1_init(&uart_fd) == 0)
+			printf("[stream_demo] uart1 ready: /dev/ttyS1 460800 8N1 (A18/A19)\n");
+		else
+			fprintf(stderr, "[stream_demo] uart1 init failed, continue without uart\n");
+
 		printf("[stream_demo] entering encode/stream loop (fd=%d)\n", venc_fd);
 		fflush(stdout);
 
@@ -443,16 +520,28 @@ int main(int argc, char *argv[])
 			tv.tv_sec  = 1;
 			tv.tv_usec = 0;
 			fd_set read_fds;
+			int max_fd;
+			int sel;
 			FD_ZERO(&read_fds);
 			FD_SET(venc_fd, &read_fds);
+			max_fd = venc_fd;
+			if (uart_fd >= 0) {
+				FD_SET(uart_fd, &read_fds);
+				if (uart_fd > max_fd)
+					max_fd = uart_fd;
+			}
 
-			int sel = select(venc_fd + 1, &read_fds, NULL, NULL, &tv);
+			sel = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
 			if (sel < 0) {
 				if (g_exit_flag) break;
 				perror("[stream_demo] select");
 				break;
 			}
-			if (sel == 0)   /* timeout — no frame yet, loop */
+
+			if (uart_fd >= 0 && FD_ISSET(uart_fd, &read_fds))
+				uart1_handle_rx_tx(uart_fd);
+
+			if (sel == 0)
 				continue;
 			if (!FD_ISSET(venc_fd, &read_fds))
 				continue;
@@ -495,6 +584,8 @@ int main(int argc, char *argv[])
 		printf("[stream_demo] shutting down after %llu frames\n",
 		       (unsigned long long)frame_count);
 		fflush(stdout);
+
+		uart1_deinit(uart_fd);
 	}
 
 err_venc:

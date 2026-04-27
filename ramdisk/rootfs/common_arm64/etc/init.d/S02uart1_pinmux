@@ -1,0 +1,37 @@
+#!/bin/sh
+
+case "$1" in
+	start)
+		if [ -x /usr/bin/cvi_pinmux ]; then
+			PINMUX_TOOL=/usr/bin/cvi_pinmux
+		elif [ -x /mnt/system/usr/bin/cvi_pinmux ]; then
+			PINMUX_TOOL=/mnt/system/usr/bin/cvi_pinmux
+		else
+			PINMUX_TOOL=""
+		fi
+
+		if [ -n "$PINMUX_TOOL" ]; then
+			"$PINMUX_TOOL" -w JTAG_CPU_TMS/UART1_TX >/dev/null 2>&1
+			"$PINMUX_TOOL" -w JTAG_CPU_TCK/UART1_RX >/dev/null 2>&1
+		else
+			if command -v devmem >/dev/null 2>&1; then
+				devmem 0x03001064 32 0x6 >/dev/null 2>&1
+				devmem 0x03001068 32 0x6 >/dev/null 2>&1
+			elif [ -x /bin/busybox ]; then
+				/bin/busybox devmem 0x03001064 32 0x6 >/dev/null 2>&1
+				/bin/busybox devmem 0x03001068 32 0x6 >/dev/null 2>&1
+			else
+				echo "[uart1_pinmux] cvi_pinmux/devmem not found"
+				exit 1
+			fi
+		fi
+		;;
+	stop)
+		;;
+	*)
+		echo "Usage: $0 {start|stop}"
+		exit 1
+		;;
+esac
+
+exit 0
