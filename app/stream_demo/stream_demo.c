@@ -333,6 +333,10 @@ static int sys_vi_init(int enc_w, int enc_h)
 
 		abChnEnable[0] = CVI_TRUE;
 
+		/* Defensive cleanup in case a previous run exited without destroying group 0 */
+		CVI_VPSS_StopGrp(0);
+		CVI_VPSS_DestroyGrp(0);
+
 		s32Ret = SAMPLE_COMM_VPSS_Init(0, abChnEnable, &stGrpAttr, stChnAttr);
 		if (s32Ret != CVI_SUCCESS) {
 			printf("[stream_demo] VPSS_Init failed 0x%x\n", s32Ret);
@@ -361,10 +365,11 @@ static void sys_vi_deinit(void)
 {
 	CVI_BOOL abChnEnable[VPSS_MAX_PHY_CHN_NUM] = { CVI_TRUE };
 
+	/* Unbind VI->VPSS first, then stop ISP so no frames reach VPSS during teardown */
 	SAMPLE_COMM_VI_UnBind_VPSS(0, 0, 0);
-	SAMPLE_COMM_VPSS_Stop(0, abChnEnable);
 	SAMPLE_COMM_VI_DestroyIsp(&g_stViConfig);
 	SAMPLE_COMM_VI_DestroyVi(&g_stViConfig);
+	SAMPLE_COMM_VPSS_Stop(0, abChnEnable);
 	SAMPLE_COMM_SYS_Exit();
 }
 
