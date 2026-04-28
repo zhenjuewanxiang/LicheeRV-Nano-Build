@@ -670,9 +670,14 @@ int rtsp_server_deinit(void)
 		return 0;
 	}
 
-	socket_close(priv.rtsp_socket);
+	if (priv.rtsp_is_start) {
+		rtsp_server_stop();
+	}
 
-	priv.rtsp_is_init = true;
+	socket_close(priv.rtsp_socket);
+	priv.rtsp_socket = socket_invalid;
+
+	priv.rtsp_is_init = false;
 	return 0;
 }
 
@@ -794,6 +799,10 @@ int rtsp_server_stop(void)
 	}
 
 	if (0 != pthread_cancel(priv.rtsp_id)) {
+		return -1;
+	}
+
+	if (0 != pthread_join(priv.rtsp_id, NULL)) {
 		return -1;
 	}
 

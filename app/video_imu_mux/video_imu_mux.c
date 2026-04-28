@@ -694,6 +694,7 @@ err_venc:
 err_vi:
 	sys_vi_deinit();
 err_rtsp:
+	rtsp_server_stop();
 	rtsp_server_deinit();
 	return ret;
 }
