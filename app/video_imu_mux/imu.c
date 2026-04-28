@@ -1,4 +1,4 @@
-#define STREAM_LOG_MODULE STREAM_LOG_MODULE_IMU
+#define LOG_MODULE "IMU"
 #include "imu.h"
 #include "log.h"
 
@@ -266,9 +266,10 @@ int imu_decode_tilt(const imu_packet_t *pkt, imu_tilt_t *out)
         out->quat[2]      = load_f32_le(d);      d += 4;
         out->quat[3]      = load_f32_le(d);
     } else if (pkt->cls == IMU_CLASS_TILT_COMPACT && pkt->length == IMU_TILT_COMPACT_PAYLOAD_LEN) {
-        out->pitch        = load_f32_le(d);      d += 4;
-        out->roll         = load_f32_le(d);      d += 4;
-        out->yaw          = load_f32_le(d);      d += 4;
+        out->has_accel    = 1;
+        out->accel[0]     = load_f32_le(d);      d += 4;
+        out->accel[1]     = load_f32_le(d);      d += 4;
+        out->accel[2]     = load_f32_le(d);      d += 4;
         out->temperature  = load_f32_le(d);
     } else {
         return -1;

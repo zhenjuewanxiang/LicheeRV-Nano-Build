@@ -55,6 +55,7 @@ static inline uint64_t log_time_us(void)
 		        (unsigned long long)(_t / 1000000ULL), \
 		        (unsigned long long)(_t % 1000000ULL), \
 		        ##__VA_ARGS__); \
+		fflush(stdout); \
 	} while (0)
 
 #define _LOG_ERR(lvl, fmt, ...) \

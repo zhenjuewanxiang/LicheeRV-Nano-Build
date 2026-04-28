@@ -37,123 +37,18 @@ static SAMPLE_INI_CFG_S        g_stIniCfg;
 static imu_parser_t           *g_imu_parser = NULL;
 
 /* ------------------------------------------------------------------ */
-/* IMU ring buffer for high-precision frame sync                       */
-/* Stores the last IMU_RING_SIZE samples with their CLOCK_MONOTONIC    */
-/* capture timestamps so we can interpolate to any frame PTS.          */
-/* The loop is single-threaded (select on venc_fd + uart_fd), so no    */
-/* mutex is required.                                                  */
+/* IMU batch buffer                                                    */
+/* Accumulate IMU_BATCH_SIZE packets then send together with one       */
+/* video frame.                                                        */
 /* ------------------------------------------------------------------ */
-#define IMU_RING_SIZE  64
+#define IMU_BATCH_SIZE 8
+#define IMU_PKT_WIRE_SIZE 28
 
-typedef struct {
-	uint64_t   capture_us; /* CLOCK_MONOTONIC µs when bytes arrived */
-	imu_tilt_t tilt;
-} imu_sample_t;
+static uint8_t g_imu_buf[IMU_BATCH_SIZE][IMU_PKT_WIRE_SIZE];
+static int      g_imu_count = 0;
 
-static imu_sample_t g_imu_ring[IMU_RING_SIZE];
-static int          g_imu_ring_head  = 0; /* next write slot */
-static int          g_imu_ring_count = 0; /* valid entries   */
+static void build_timu_pkt(uint8_t out[IMU_PKT_WIRE_SIZE], const imu_tilt_t *tilt);
 
-/*
- * Clock-domain calibration: offset_us = CLOCK_MONOTONIC_us - imu_system_time_us
- * Computed once at the first received IMU packet and held constant.
- * Converts any imu_tilt_t.system_time to CLOCK_MONOTONIC µs:
- *   capture_us = (uint64_t)(system_time * 1e6) + g_imu_clk_offset_us
- */
-static int64_t  g_imu_clk_offset_us    = 0;
-static int      g_imu_clk_offset_valid = 0;
-
-/* Forward declaration — defined in Helpers section below. */
-static uint64_t get_time_us(void);
-
-/* Push a new sample into the ring (overwrites oldest when full).
- * capture_us must already be in CLOCK_MONOTONIC µs domain. */
-static void imu_ring_push(const imu_tilt_t *tilt, uint64_t capture_us)
-{
-	g_imu_ring[g_imu_ring_head].capture_us = capture_us;
-	g_imu_ring[g_imu_ring_head].tilt       = *tilt;
-	g_imu_ring_head = (g_imu_ring_head + 1) % IMU_RING_SIZE;
-	if (g_imu_ring_count < IMU_RING_SIZE)
-		g_imu_ring_count++;
-}
-
-/*
- * Interpolate (or clamp-extrapolate) the IMU ring buffer to target_us.
- *
- * Iterates from oldest to newest entry.  Finds the two adjacent samples
- * that bracket target_us and linearly interpolates between them.
- * If target_us is outside the buffered range the nearest endpoint is used.
- *
- * Returns 0 on success, -1 when the ring is empty.
- * On success *residual_us receives the distance to the nearest sample
- * (0 when perfectly between two samples, positive when extrapolating).
- */
-static int imu_ring_interpolate(uint64_t target_us, imu_tilt_t *out,
-                                uint32_t *residual_us)
-{
-	int count = g_imu_ring_count;
-	int oldest, i;
-	int prev_idx = -1, next_idx = -1;
-
-	if (count == 0)
-		return -1;
-
-	/* Oldest slot: if buffer not full it starts at 0; otherwise at head. */
-	oldest = (count < IMU_RING_SIZE) ? 0 : g_imu_ring_head;
-
-	/* Find bracketing pair. */
-	for (i = 0; i < count; i++) {
-		int idx = (oldest + i) % IMU_RING_SIZE;
-
-		if (g_imu_ring[idx].capture_us <= target_us)
-			prev_idx = idx;
-		else {
-			next_idx = idx;
-			break;
-		}
-	}
-
-	if (prev_idx < 0) {
-		/* target is before all samples — clamp to oldest */
-		*out = g_imu_ring[oldest % IMU_RING_SIZE].tilt;
-		*residual_us = (uint32_t)(g_imu_ring[oldest % IMU_RING_SIZE].capture_us
-		                          - target_us);
-		return 0;
-	}
-	if (next_idx < 0) {
-		/* target is after all samples — clamp to newest */
-		int newest = (g_imu_ring_head - 1 + IMU_RING_SIZE) % IMU_RING_SIZE;
-		*out = g_imu_ring[newest].tilt;
-		*residual_us = (uint32_t)(target_us
-		                          - g_imu_ring[newest].capture_us);
-		return 0;
-	}
-
-	/* Linear interpolation between prev and next. */
-	{
-		uint64_t t0    = g_imu_ring[prev_idx].capture_us;
-		uint64_t t1    = g_imu_ring[next_idx].capture_us;
-		double   alpha = (t1 > t0) ?
-		                 (double)(target_us - t0) / (double)(t1 - t0) : 0.0;
-		const imu_tilt_t *a = &g_imu_ring[prev_idx].tilt;
-		const imu_tilt_t *b = &g_imu_ring[next_idx].tilt;
-
-#define LERP(f) (float)((a->f) + alpha * ((b->f) - (a->f)))
-		out->pitch       = LERP(pitch);
-		out->roll        = LERP(roll);
-		out->yaw         = LERP(yaw);
-		out->gyro[0]     = LERP(gyro[0]);
-		out->gyro[1]     = LERP(gyro[1]);
-		out->gyro[2]     = LERP(gyro[2]);
-		out->temperature = LERP(temperature);
-#undef LERP
-		out->status   = a->status;   /* discrete — nearest (prev) */
-		out->has_accel = a->has_accel;
-		out->has_quat  = a->has_quat;
-		*residual_us  = 0;
-	}
-	return 0;
-}
 
 static void sig_handle(int signo)
 {
@@ -163,68 +58,29 @@ static void sig_handle(int signo)
 	g_exit_flag = 1;
 }
 
-/* ------------------------------------------------------------------ */
-/* Helpers                                                             */
-/* ------------------------------------------------------------------ */
 
-static uint64_t get_time_us(void)
-{
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000;
-}
-
-/**
- * @brief Print decoded imu tilt packet.
- * @param t_pkt Input imu packet.
- * @param t_user User context pointer.
- * @return None.
- */
-static void imu_packet_print(const imu_packet_t *t_pkt, void *t_user)
+/* Accumulate decoded IMU packets into g_imu_buf.
+ * Called from imu_parser_feed() on every complete, checksummed packet.
+ * When the buffer is full (IMU_BATCH_SIZE) the main loop sends a frame. */
+static void on_imu_packet(const imu_packet_t *t_pkt, void *t_user)
 {
 	imu_tilt_t tilt;
 
 	(void)t_user;
 
-	if (!t_pkt)
+	if (!t_pkt || imu_decode_tilt(t_pkt, &tilt) != 0)
 		return;
 
-	if (imu_decode_tilt(t_pkt, &tilt) != 0)
-		return;
+	if (g_imu_count >= IMU_BATCH_SIZE)
+		return; /* batch not consumed yet; drop oldest-overrun */
 
-	/* Convert IMU system_time to CLOCK_MONOTONIC µs via calibrated offset.
-	 * On the first packet, compute offset = mono_now - imu_now. */
-	{
-		uint64_t imu_us   = (uint64_t)(tilt.system_time * 1e6);
-		uint64_t mono_now = get_time_us();
-		uint64_t capture_us;
+	build_timu_pkt(g_imu_buf[g_imu_count], &tilt);
+	g_imu_count++;
 
-		/* Dynamic EMA offset: tracks clock drift between IMU oscillator
-		 * and Linux CLOCK_MONOTONIC.  Both devices start from 0 at power-on
-		 * so the raw difference is approximately the UART pipeline delay.
-		 * α = 1/100 ≈ 0.01  →  time constant ≈ 100 packets (~1 s at 100 Hz).
-		 * Integer-only arithmetic: new = old + (raw - old) / 100            */
-		{
-			int64_t raw_offset = (int64_t)mono_now - (int64_t)imu_us;
-			if (!g_imu_clk_offset_valid) {
-				g_imu_clk_offset_us    = raw_offset;
-				g_imu_clk_offset_valid = 1;
-			} else {
-				g_imu_clk_offset_us = g_imu_clk_offset_us
-				                    + (raw_offset - g_imu_clk_offset_us) / 100;
-			}
-		}
-		capture_us = (uint64_t)((int64_t)imu_us + g_imu_clk_offset_us);
-		imu_ring_push(&tilt, capture_us);
-
-		/* Clock-domain diagnostics: once per second at DEBUG level. */
-		LOGD_RL(1000000ULL,
-		        "clk mono=%llu imu=%llu raw_diff=%lld ema_off=%lld us\n",
-		        (unsigned long long)mono_now,
-		        (unsigned long long)imu_us,
-		        (long long)((int64_t)mono_now - (int64_t)imu_us),
-		        (long long)g_imu_clk_offset_us);
-	}
+	LOGT("imu[%d] ts=%.3f gyro=%.2f %.2f %.2f\n",
+	     g_imu_count - 1,
+	     (float)tilt.system_time,
+	     tilt.gyro[0], tilt.gyro[1], tilt.gyro[2]);
 }
 
 static int uart1_init(int *t_uart_fd)
@@ -264,7 +120,7 @@ static int uart1_init(int *t_uart_fd)
 	}
 
 	if (!g_imu_parser) {
-		g_imu_parser = imu_parser_create(imu_packet_print, NULL);
+		g_imu_parser = imu_parser_create(on_imu_packet, NULL);
 		if (!g_imu_parser) {
 			close(fd);
 			return -1;
@@ -306,128 +162,41 @@ static void uart1_handle_rx_tx(int t_uart_fd)
 		imu_parser_feed(g_imu_parser, (const uint8_t *)rx_buf, (size_t)rx_len);
 }
 
-static int is_h265_vcl_nalu(H265E_NALU_TYPE_E enType)
+static const uint8_t k_sei_uuid[16] = {
+	0xAA, 0xAA, 0xAA, 0xAA, 0xBB, 0xBB, 0xBB, 0xBB,
+	0xCC, 0xCC, 0xCC, 0xCC, 0xDD, 0xDD, 0xDD, 0xDD
+};
+
+static void build_timu_pkt(uint8_t out[IMU_PKT_WIRE_SIZE], const imu_tilt_t *tilt)
 {
-	return enType == H265E_NALU_BSLICE ||
-	       enType == H265E_NALU_PSLICE ||
-	       enType == H265E_NALU_ISLICE ||
-	       enType == H265E_NALU_IDRSLICE;
+	/* TImuData: float ts, x0, y0, z0, x1, y1, z1 — 7 x 4 = 28 bytes */
+	float v[7];
+	v[0] = (float)tilt->system_time;
+	v[1] = tilt->gyro[0];
+	v[2] = tilt->gyro[1];
+	v[3] = tilt->gyro[2];
+	v[4] = tilt->has_accel ? tilt->accel[0] : 0.0f;
+	v[5] = tilt->has_accel ? tilt->accel[1] : 0.0f;
+	v[6] = tilt->has_accel ? tilt->accel[2] : 0.0f;
+	memcpy(out, v, 28);
 }
 
-/*
- * Build H.265 prefix SEI carrying an IMU snapshot interpolated to frame_pts_us.
- *
- * frame_pts_us: hardware frame PTS in CLOCK_MONOTONIC µs (from pstPack[0].u64PTS).
- *
- * Annex-B NAL layout:
- *   [0..3]   start code (0x00 0x00 0x00 0x01)
- *   [4]      nal_type byte: (39 << 1) = 0x4E (prefix_sei)
- *   [5]      temporal_id_plus1 = 0x01
- *   [6..8]   SEI message header:
- *     [6]    payload_type = 5 (user_data_unregistered)
- *     [7]    payload_size = 0xFF (+ [8]=0x01 → 256 bytes)
- *   [9..264] SEI payload (256 bytes):
- *     [0..3]    frame_pts_ms      uint32 BE  — frame hardware PTS (ms)
- *     [4]       imu_valid         uint8      — 1 if interpolation succeeded
- *     [5..8]    imu_residual_us   uint32 BE  — bracket residual (µs)
- *     [9..12]   pitch             float32 LE (deg)
- *     [13..16]  roll              float32 LE (deg)
- *     [17..20]  yaw               float32 LE (deg)
- *     [21..24]  gyro[0]           float32 LE (deg/s)
- *     [25..28]  gyro[1]           float32 LE (deg/s)
- *     [29..32]  gyro[2]           float32 LE (deg/s)
- *     [33..36]  temperature       float32 LE (°C)
- *     [37]      status            uint8
- *     [38..255] reserved          (zeros)
- */
-static size_t build_h265_prefix_sei(uint8_t *dst, size_t dst_size,
-                                    uint64_t frame_pts_us)
+/* Build one H.265 prefix SEI NAL (user_data_unregistered) with 8 TImuPkt blobs. */
+static size_t build_h265_prefix_sei(uint8_t *dst, size_t dst_size)
 {
-	uint8_t payload[256];
-	uint8_t sei_rbsp[1 + 4 + 16 + 256 + 1]; /* type + size(<=4 bytes enough) + data + rbsp_trailing_bits */
-	static const uint8_t k_sei_uuid[16] = {
-		0xAA, 0xAA, 0xAA, 0xAA, 0xBB, 0xBB, 0xBB, 0xBB,
-		0xCC, 0xCC, 0xCC, 0xCC, 0xDD, 0xDD, 0xDD, 0xDD
-	};
-	size_t out = 0;
+	uint8_t sei_rbsp[1 + 4 + 16 + 1 + (IMU_BATCH_SIZE * IMU_PKT_WIRE_SIZE) + 1];
 	size_t rbsp_len = 0;
+	size_t out = 0;
 	size_t i;
 	int zero_count = 0;
-	int payload_size = 16 + (int)sizeof(payload);
-	int remain;
+	int payload_size = 16 + 1 + (IMU_BATCH_SIZE * IMU_PKT_WIRE_SIZE);
+	int remain = payload_size;
 
-	if (!dst || dst_size < 64)
+	if (!dst)
 		return 0;
 
-	memset(payload, 0, sizeof(payload));
-	memset(sei_rbsp, 0, sizeof(sei_rbsp));
-
-	/* Build payload using TH264SEI layout (249 bytes), remaining bytes keep zero.
-	 * struct layout:
-	 *   [0..3]   Head    = 0x01000000 (little-endian bytes: 00 00 00 01)
-	 *   [4]      sei     = 0x06
-	 *   [5]      seitype = 0x05
-	 *   [6]      len     = 242 (uuid + type + union(224) + ends)
-	 *   [7..22]  uuid[16]
-	 *   [23]     type    = 2 (SEI_PAYLOAD_TYPE_XYZ)
-	 *   [24..247] union  = jStr[224]
-	 *   [248]    ends    = 0x80 */
-	payload[0] = 0x00;
-	payload[1] = 0x00;
-	payload[2] = 0x00;
-	payload[3] = 0x01;
-	payload[4] = 0x06;
-	payload[5] = 0x05;
-	payload[6] = 242;
-	memcpy(&payload[7], k_sei_uuid, sizeof(k_sei_uuid));
-	payload[23] = 2;
-
-	/* Fill union.jStr[224] with frame/IMU fields.
-	 * jStr offsets below are relative to payload[24]. */
-	{
-		imu_tilt_t imu;
-		uint32_t   residual_us = 0;
-		uint32_t pts_ms = (uint32_t)(frame_pts_us / 1000ULL);
-
-		/* Verify PTS vs ring head at TRACE level, once per second. */
-#if LOG_LEVEL >= LOG_LEVEL_TRACE
-		if (g_imu_ring_count > 0) {
-			int newest = (g_imu_ring_head - 1 + IMU_RING_SIZE) % IMU_RING_SIZE;
-			uint64_t newest_us = g_imu_ring[newest].capture_us;
-			LOGT_RL(1000000ULL,
-			        "sei frame_pts=%llu newest_imu=%llu diff=%lld us\n",
-			        (unsigned long long)frame_pts_us,
-			        (unsigned long long)newest_us,
-			        (long long)((int64_t)newest_us - (int64_t)frame_pts_us));
-		}
-#endif
-
-		if (imu_ring_interpolate(frame_pts_us, &imu, &residual_us) == 0) {
-			payload[24] = (uint8_t)((pts_ms >> 24) & 0xFF);
-			payload[25] = (uint8_t)((pts_ms >> 16) & 0xFF);
-			payload[26] = (uint8_t)((pts_ms >>  8) & 0xFF);
-			payload[27] = (uint8_t)( pts_ms        & 0xFF);
-			payload[28] = 1;  /* imu_valid */
-			payload[29] = (uint8_t)((residual_us >> 24) & 0xFF);
-			payload[30] = (uint8_t)((residual_us >> 16) & 0xFF);
-			payload[31] = (uint8_t)((residual_us >>  8) & 0xFF);
-			payload[32] = (uint8_t)( residual_us        & 0xFF);
-			memcpy(&payload[33], &imu.pitch,       4);
-			memcpy(&payload[37], &imu.roll,        4);
-			memcpy(&payload[41], &imu.yaw,         4);
-			memcpy(&payload[45], &imu.gyro[0],     4);
-			memcpy(&payload[49], &imu.gyro[1],     4);
-			memcpy(&payload[53], &imu.gyro[2],     4);
-			memcpy(&payload[57], &imu.temperature, 4);
-			payload[61] = imu.status;
-		}
-	}
-	payload[248] = 0x80;
-
-	/* Build RBSP (without start code / NAL header). */
-	sei_rbsp[rbsp_len++] = 5;  /* payload_type: user_data_unregistered */
-
-	remain = payload_size;
+	/* SEI payload_type=5 (user_data_unregistered). */
+	sei_rbsp[rbsp_len++] = 5;
 	while (remain >= 0xFF) {
 		sei_rbsp[rbsp_len++] = 0xFF;
 		remain -= 0xFF;
@@ -436,21 +205,23 @@ static size_t build_h265_prefix_sei(uint8_t *dst, size_t dst_size,
 
 	memcpy(&sei_rbsp[rbsp_len], k_sei_uuid, sizeof(k_sei_uuid));
 	rbsp_len += sizeof(k_sei_uuid);
-	memcpy(&sei_rbsp[rbsp_len], payload, sizeof(payload));
-	rbsp_len += sizeof(payload);
+	sei_rbsp[rbsp_len++] = 2; /* userdata0: payload version/type */
+	memcpy(&sei_rbsp[rbsp_len], &g_imu_buf[0][0], IMU_BATCH_SIZE * IMU_PKT_WIRE_SIZE);
+	rbsp_len += IMU_BATCH_SIZE * IMU_PKT_WIRE_SIZE;
 	sei_rbsp[rbsp_len++] = 0x80; /* rbsp_trailing_bits */
 
-	/* Annex-B start code + NAL header (must not be emulation-protected). */
 	if (dst_size < 6)
 		return 0;
+
+	/* Annex-B start code + prefix SEI NAL header (nal_unit_type=39). */
 	dst[out++] = 0x00;
 	dst[out++] = 0x00;
 	dst[out++] = 0x00;
 	dst[out++] = 0x01;
-	dst[out++] = 39 << 1; /* nal_unit_type = 39 (prefix_sei), nuh_layer_id = 0 */
-	dst[out++] = 0x01;    /* temporal_id_plus1 = 1 */
+	dst[out++] = 39 << 1;
+	dst[out++] = 0x01;
 
-	/* Emulation prevention over RBSP bytes only. */
+	/* Emulation prevention for RBSP bytes only. */
 	for (i = 0; i < rbsp_len; i++) {
 		uint8_t b = sei_rbsp[i];
 
@@ -464,6 +235,7 @@ static size_t build_h265_prefix_sei(uint8_t *dst, size_t dst_size,
 		if (out >= dst_size)
 			return 0;
 		dst[out++] = b;
+
 		if (b == 0x00)
 			zero_count++;
 		else
@@ -473,39 +245,89 @@ static size_t build_h265_prefix_sei(uint8_t *dst, size_t dst_size,
 	return out;
 }
 
-/* Send one VENC frame via RTSP and inject one prefix SEI before the first VCL NAL. */
-static void send_venc_stream(VENC_STREAM_S *pstStream)
+/*
+ * Get one encoded frame from VENC, send TH264SEI + all video NALs, reset
+ * the IMU batch counter.  Call only when g_imu_count == IMU_BATCH_SIZE.
+ *
+ * If the encoder has no frame ready the IMU batch is discarded and a
+ * warning is logged so the pipeline does not stall.
+ */
+/*
+ * Try to send one video frame together with the accumulated IMU batch.
+ *
+ * Called only when g_imu_count == IMU_BATCH_SIZE AND venc_fd is readable.
+ * If the encoder has no frame ready yet (should be rare since venc_fd fired),
+ * the IMU batch is kept intact so the next call can retry.
+ * The batch is reset only after a successful send.
+ */
+static void send_batch(VENC_CHN chn)
 {
-	CVI_U32 i;
-	int sei_sent = 0;
-	uint8_t sei_nal[512];
-	/* Use the hardware PTS of the first pack as the frame capture time.
-	 * u64PTS is in µs on the same CLOCK_MONOTONIC domain as get_time_us(). */
-	uint64_t frame_pts_us = (pstStream->u32PackCount > 0)
-	                        ? pstStream->pstPack[0].u64PTS
-	                        : get_time_us();
-	size_t sei_len = build_h265_prefix_sei(sei_nal, sizeof(sei_nal), frame_pts_us);
+	VENC_CHN_STATUS_S stStat   = {};
+	VENC_STREAM_S     stStream = {};
+	CVI_U32           i;
+	uint8_t           sei_nal[1024];
+	size_t            sei_len;
 
-	if (pstStream->u32PackCount == 0)
+	if (CVI_VENC_QueryStatus(chn, &stStat) != CVI_SUCCESS ||
+	    stStat.u32CurPacks == 0) {
+		LOGD_RL(1000000ULL, "send_batch: venc not ready, holding IMU batch\n");
+		return; /* keep g_imu_count intact, retry next time venc_fd fires */
+	}
+
+	stStream.pstPack = (VENC_PACK_S *)malloc(
+	    sizeof(VENC_PACK_S) * stStat.u32CurPacks);
+	if (!stStream.pstPack)
 		return;
 
-	/* Send each NAL unit separately so the RTSP H265 source sees
-	 * one NAL per call (start-code Annex-B data per pack). */
-	for (i = 0; i < pstStream->u32PackCount; i++) {
-		VENC_PACK_S *p = &pstStream->pstPack[i];
-		int len = (int)(p->u32Len - p->u32Offset);
+	if (CVI_VENC_GetStream(chn, &stStream, 1000) != CVI_SUCCESS) {
+		free(stStream.pstPack);
+		return;
+	}
 
-		if (!sei_sent && is_h265_vcl_nalu(p->DataType.enH265EType) && sei_len > 0) {
-			rtsp_send_h265_data(sei_nal, sei_len);
-			sei_sent = 1;
-		}
+	/* Frame acquired — now build SEI and send. */
+	sei_len = build_h265_prefix_sei(sei_nal, sizeof(sei_nal));
+	if (sei_len == 0) {
+		CVI_VENC_ReleaseStream(chn, &stStream);
+		free(stStream.pstPack);
+		LOGW("build_h265_prefix_sei failed, dropping this batch\n");
+		g_imu_count = 0;
+		return;
+	}
+	g_imu_count = 0;
 
+	/* SEI first, then video NALs. */
+	rtsp_send_h265_data(sei_nal, sei_len);
+
+	for (i = 0; i < stStream.u32PackCount; i++) {
+		VENC_PACK_S *p   = &stStream.pstPack[i];
+		int          len = (int)(p->u32Len - p->u32Offset);
 		if (len > 0)
 			rtsp_send_h265_data(p->pu8Addr + p->u32Offset, (size_t)len);
 	}
 
-	if (!sei_sent && sei_len > 0)
-		rtsp_send_h265_data(sei_nal, sei_len);
+	CVI_VENC_ReleaseStream(chn, &stStream);
+	free(stStream.pstPack);
+}
+
+/* Drain one pending VENC frame without sending (prevents encoder stall). */
+static void drain_venc(VENC_CHN chn)
+{
+	VENC_CHN_STATUS_S stStat   = {};
+	VENC_STREAM_S     stStream = {};
+
+	if (CVI_VENC_QueryStatus(chn, &stStat) != CVI_SUCCESS ||
+	    stStat.u32CurPacks == 0)
+		return;
+
+	stStream.pstPack = (VENC_PACK_S *)malloc(
+	    sizeof(VENC_PACK_S) * stStat.u32CurPacks);
+	if (!stStream.pstPack)
+		return;
+
+	if (CVI_VENC_GetStream(chn, &stStream, 0) == CVI_SUCCESS)
+		CVI_VENC_ReleaseStream(chn, &stStream);
+
+	free(stStream.pstPack);
 }
 
 /* ------------------------------------------------------------------ */
@@ -797,7 +619,6 @@ int main(int argc, char *argv[])
 		CVI_S32        venc_fd  = CVI_VENC_GetFd(VencChn);
 		int            uart_fd  = -1;
 		uint64_t       frame_count = 0;
-		uint64_t       last_us    = get_time_us();
 
 		if (venc_fd <= 0) {
 			LOGE("CVI_VENC_GetFd failed %d\n", venc_fd);
@@ -812,13 +633,18 @@ int main(int argc, char *argv[])
 
 		LOGI("entering encode/stream loop (fd=%d)\n", venc_fd);
 
+		/*
+		 * Main loop:
+		 *   - IMU drives sending: every IMU_BATCH_SIZE packets → send_batch()
+		 *   - venc_fd is monitored only to drain encoder output when the IMU
+		 *     batch is not yet full; this prevents the encoder ring buffer from
+		 *     stalling under sustained load.
+		 */
 		while (!g_exit_flag) {
-			struct timeval tv;
-			tv.tv_sec  = 1;
-			tv.tv_usec = 0;
+			struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 }; /* 50 ms */
 			fd_set read_fds;
-			int max_fd;
-			int sel;
+			int max_fd, sel;
+
 			FD_ZERO(&read_fds);
 			FD_SET(venc_fd, &read_fds);
 			max_fd = venc_fd;
@@ -835,44 +661,25 @@ int main(int argc, char *argv[])
 				break;
 			}
 
+			/* Process incoming IMU bytes first. */
 			if (uart_fd >= 0 && FD_ISSET(uart_fd, &read_fds))
 				uart1_handle_rx_tx(uart_fd);
 
-			if (sel == 0)
-				continue;
-			if (!FD_ISSET(venc_fd, &read_fds))
-				continue;
-
-			/* Query how many packs are ready */
-			VENC_CHN_STATUS_S stStat = {};
-			if (CVI_VENC_QueryStatus(VencChn, &stStat) != CVI_SUCCESS)
-				continue;
-			if (stStat.u32CurPacks == 0)
-				continue;
-
-			VENC_STREAM_S stStream = {};
-			stStream.pstPack = (VENC_PACK_S *)malloc(
-			    sizeof(VENC_PACK_S) * stStat.u32CurPacks);
-			if (!stStream.pstPack)
-				continue;
-
-			if (CVI_VENC_GetStream(VencChn, &stStream, 1000) == CVI_SUCCESS) {
-				if (frame_count == 0) {
-					LOGI("first H265 frame: %u packs\n",
-					     stStream.u32PackCount);
+			if (FD_ISSET(venc_fd, &read_fds)) {
+				if (g_imu_count >= IMU_BATCH_SIZE) {
+					/* IMU batch full and encoder has a frame: send together. */
+					send_batch(VencChn);
+					if (g_imu_count == 0) { /* send succeeded */
+						frame_count++;
+						if (frame_count == 1)
+							LOGI("first batch sent\n");
+						LOGI_RL(5000000ULL, "sent %llu batches\n",
+						        (unsigned long long)frame_count);
+					}
+				} else {
+					/* Batch not full yet: drain encoder to prevent stall. */
+					drain_venc(VencChn);
 				}
-				send_venc_stream(&stStream);
-				CVI_VENC_ReleaseStream(VencChn, &stStream);
-				frame_count++;
-			}
-			free(stStream.pstPack);
-
-			uint64_t now = get_time_us();
-			if (frame_count % 100 == 0 && frame_count > 0) {
-				LOGI("frame %llu  fps=%.1f\n",
-				     (unsigned long long)frame_count,
-				     100.0 * 1e6 / (double)(now - last_us));
-				last_us = now;
 			}
 		}
 
