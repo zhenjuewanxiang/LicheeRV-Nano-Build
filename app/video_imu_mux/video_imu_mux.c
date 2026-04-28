@@ -1,10 +1,10 @@
 /*
- * stream_demo.c - H.265 RTSP streaming demo
+ * video_imu_mux.c - H.265 RTSP video and IMU muxer
  *
  * Pipeline: VI (GC4653) -> ISP -> VPSS -> H.265 VENC -> RTSP server
  * Mode: VI_OFFLINE_VPSS_ONLINE + VPSS_INPUT_ISP (VPSS_MODE_SINGLE)
  *
- * Usage: stream_demo [enc_width enc_height]
+ * Usage: video_imu_mux [enc_width enc_height]
  *   Default encode resolution: 2560x1440 (GC4653 max)
  *   Sensor size: read from /mnt/data/sensor_cfg.ini (GC4653 = 2560x1440)
  *   Stream URL: rtsp://<device-ip>:8554/live
@@ -21,7 +21,9 @@
 #include <errno.h>
 #include <termios.h>
 
+#define LOG_MODULE "MUX"
 #include "imu.h"
+#include "log.h"
 #include "sample_comm.h"
 #include "rtsp-server.h"
 
@@ -215,40 +217,14 @@ static void imu_packet_print(const imu_packet_t *t_pkt, void *t_user)
 		capture_us = (uint64_t)((int64_t)imu_us + g_imu_clk_offset_us);
 		imu_ring_push(&tilt, capture_us);
 
-		/* Print raw times once per second for clock-domain verification. */
-		{
-			static uint64_t last_print_us = 0;
-			if (mono_now - last_print_us >= 1000000ULL) {
-				int64_t raw_now = (int64_t)mono_now - (int64_t)imu_us;
-				last_print_us = mono_now;
-				printf("[sync-dbg] mono=%llu  imu=%llu  raw_diff=%lld  ema_offset=%lld us\n",
-				       (unsigned long long)mono_now,
-				       (unsigned long long)imu_us,
-				       (long long)raw_now,
-				       (long long)g_imu_clk_offset_us);
-				fflush(stdout);
-			}
-		}
+		/* Clock-domain diagnostics: once per second at DEBUG level. */
+		LOGD_RL(1000000ULL,
+		        "clk mono=%llu imu=%llu raw_diff=%lld ema_off=%lld us\n",
+		        (unsigned long long)mono_now,
+		        (unsigned long long)imu_us,
+		        (long long)((int64_t)mono_now - (int64_t)imu_us),
+		        (long long)g_imu_clk_offset_us);
 	}
-
-	// printf("[imu] time=%.3f status=%u\n",
-	//        tilt.system_time, tilt.status);
-	// printf("[imu] gyro=%.4f %.4f %.4f deg/s\n",
-	//        tilt.gyro[0], tilt.gyro[1], tilt.gyro[2]);
-	// if (tilt.has_accel) {
-	// 	printf("[imu] accel=%.4f %.4f %.4f m/s^2\n",
-	// 	       tilt.accel[0], tilt.accel[1], tilt.accel[2]);
-	// }
-	// printf("[imu] euler pitch=%.4f roll=%.4f yaw=%.4f deg\n",
-	//        tilt.pitch, tilt.roll, tilt.yaw);
-	// if (tilt.has_quat) {
-	// 	printf("[imu] temp=%.3f C quat=%.6f %.6f %.6f %.6f\n",
-	// 	       tilt.temperature,
-	// 	       tilt.quat[0], tilt.quat[1], tilt.quat[2], tilt.quat[3]);
-	// } else {
-	// 	printf("[imu] temp=%.3f C\n", tilt.temperature);
-	// }
-	fflush(stdout);
 }
 
 static int uart1_init(int *t_uart_fd)
@@ -321,11 +297,11 @@ static void uart1_handle_rx_tx(int t_uart_fd)
 	rx_len = read(t_uart_fd, rx_buf, sizeof(rx_buf));
 	if (rx_len <= 0) {
 		if (rx_len < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
-			perror("[stream_demo] uart1 read");
+			LOGP("uart1 read");
 		return;
 	}
 
-	// printf("[stream_demo] uart1 rx %zd bytes\r\n", rx_len);
+	// printf("uart1 rx %zd bytes\r\n", rx_len);
 	if (g_imu_parser)
 		imu_parser_feed(g_imu_parser, (const uint8_t *)rx_buf, (size_t)rx_len);
 }
@@ -413,19 +389,18 @@ static size_t build_h265_prefix_sei(uint8_t *dst, size_t dst_size,
 		uint32_t   residual_us = 0;
 		uint32_t pts_ms = (uint32_t)(frame_pts_us / 1000ULL);
 
-		/* Debug: verify PTS vs ring head timing.
-		 * newest_us should be slightly >= frame_pts_us for perfect bracketing.
-		 * Remove once timing is confirmed correct. */
+		/* Verify PTS vs ring head at TRACE level, once per second. */
+#if LOG_LEVEL >= LOG_LEVEL_TRACE
 		if (g_imu_ring_count > 0) {
 			int newest = (g_imu_ring_head - 1 + IMU_RING_SIZE) % IMU_RING_SIZE;
 			uint64_t newest_us = g_imu_ring[newest].capture_us;
-			int64_t  diff_us   = (int64_t)newest_us - (int64_t)frame_pts_us;
-			printf("[sync] frame_pts_us=%llu newest_imu_us=%llu diff=%lld us\n",
-			       (unsigned long long)frame_pts_us,
-			       (unsigned long long)newest_us,
-			       (long long)diff_us);
-			fflush(stdout);
+			LOGT_RL(1000000ULL,
+			        "sei frame_pts=%llu newest_imu=%llu diff=%lld us\n",
+			        (unsigned long long)frame_pts_us,
+			        (unsigned long long)newest_us,
+			        (long long)((int64_t)newest_us - (int64_t)frame_pts_us));
 		}
+#endif
 
 		if (imu_ring_interpolate(frame_pts_us, &imu, &residual_us) == 0) {
 			payload[24] = (uint8_t)((pts_ms >> 24) & 0xFF);
@@ -554,35 +529,35 @@ static int sys_vi_init(int enc_w, int enc_h)
 
 	/* Step 1: parse sensor_cfg.ini */
 	if (SAMPLE_COMM_VI_ParseIni(&stIniCfg))
-		printf("[stream_demo] sensor_cfg.ini parsed OK\n");
+		LOGI("sensor_cfg.ini parsed OK\n");
 
 	CVI_VI_SetDevNum(stIniCfg.devNum);
 
 	/* Step 2: build VI config from ini */
 	s32Ret = SAMPLE_COMM_VI_IniToViCfg(&stIniCfg, &stViConfig);
 	if (s32Ret != CVI_SUCCESS) {
-		printf("[stream_demo] IniToViCfg failed 0x%x\n", s32Ret);
+		LOGE("IniToViCfg failed 0x%x\n", s32Ret);
 		return s32Ret;
 	}
 
 	/* Step 3: get native sensor frame size */
 	s32Ret = SAMPLE_COMM_VI_GetSizeBySensor(stIniCfg.enSnsType[0], &enPicSize);
 	if (s32Ret != CVI_SUCCESS) {
-		printf("[stream_demo] GetSizeBySensor failed 0x%x\n", s32Ret);
+		LOGE("GetSizeBySensor failed 0x%x\n", s32Ret);
 		return s32Ret;
 	}
 	s32Ret = SAMPLE_COMM_SYS_GetPicSize(enPicSize, &stSensorSize);
 	if (s32Ret != CVI_SUCCESS) {
-		printf("[stream_demo] GetPicSize failed 0x%x\n", s32Ret);
+		LOGE("GetPicSize failed 0x%x\n", s32Ret);
 		return s32Ret;
 	}
-	printf("[stream_demo] sensor size: %ux%u\n",
-	       stSensorSize.u32Width, stSensorSize.u32Height);
+	LOGI("sensor size: %ux%u\n",
+	     stSensorSize.u32Width, stSensorSize.u32Height);
 
 	/* Step 4: init VB pools sized for sensor frame */
 	s32Ret = SAMPLE_PLAT_SYS_INIT(stSensorSize);
 	if (s32Ret != CVI_SUCCESS) {
-		printf("[stream_demo] SYS_INIT failed 0x%x\n", s32Ret);
+		LOGE("SYS_INIT failed 0x%x\n", s32Ret);
 		return s32Ret;
 	}
 
@@ -600,12 +575,12 @@ static int sys_vi_init(int enc_w, int enc_h)
 
 		s32Ret = CVI_SYS_SetVIVPSSMode(&stVIVPSSMode);
 		if (s32Ret != CVI_SUCCESS) {
-			printf("[stream_demo] SetVIVPSSMode failed 0x%x\n", s32Ret);
+			LOGE("SetVIVPSSMode failed 0x%x\n", s32Ret);
 			return s32Ret;
 		}
 		s32Ret = CVI_SYS_SetVPSSModeEx(&stVPSSMode);
 		if (s32Ret != CVI_SUCCESS) {
-			printf("[stream_demo] SetVPSSModeEx failed 0x%x\n", s32Ret);
+			LOGE("SetVPSSModeEx failed 0x%x\n", s32Ret);
 			return s32Ret;
 		}
 	}
@@ -613,7 +588,7 @@ static int sys_vi_init(int enc_w, int enc_h)
 	/* Step 6: start sensor, MIPI, ISP, VI pipe & channels */
 	s32Ret = SAMPLE_PLAT_VI_INIT(&stViConfig);
 	if (s32Ret != CVI_SUCCESS) {
-		printf("[stream_demo] PLAT_VI_INIT failed 0x%x\n", s32Ret);
+		LOGE("PLAT_VI_INIT failed 0x%x\n", s32Ret);
 		return s32Ret;
 	}
 
@@ -659,12 +634,12 @@ static int sys_vi_init(int enc_w, int enc_h)
 
 		s32Ret = SAMPLE_COMM_VPSS_Init(0, abChnEnable, &stGrpAttr, stChnAttr);
 		if (s32Ret != CVI_SUCCESS) {
-			printf("[stream_demo] VPSS_Init failed 0x%x\n", s32Ret);
+			LOGE("VPSS_Init failed 0x%x\n", s32Ret);
 			return s32Ret;
 		}
 		s32Ret = SAMPLE_COMM_VPSS_Start(0, abChnEnable, &stGrpAttr, stChnAttr);
 		if (s32Ret != CVI_SUCCESS) {
-			printf("[stream_demo] VPSS_Start failed 0x%x\n", s32Ret);
+			LOGE("VPSS_Start failed 0x%x\n", s32Ret);
 			return s32Ret;
 		}
 	}
@@ -672,12 +647,12 @@ static int sys_vi_init(int enc_w, int enc_h)
 	/* Step 8: bind VI pipe 0 channel 0 -> VPSS group 0 */
 	s32Ret = SAMPLE_COMM_VI_Bind_VPSS(0, 0, 0);
 	if (s32Ret != CVI_SUCCESS) {
-		printf("[stream_demo] VI_Bind_VPSS failed 0x%x\n", s32Ret);
+		LOGE("VI_Bind_VPSS failed 0x%x\n", s32Ret);
 		return s32Ret;
 	}
 
-	printf("[stream_demo] VI+VPSS init OK, encode %ux%u\n",
-	       stEncSize.u32Width, stEncSize.u32Height);
+	LOGI("VI+VPSS init OK, encode %ux%u\n",
+	     stEncSize.u32Width, stEncSize.u32Height);
 	return CVI_SUCCESS;
 }
 
@@ -728,14 +703,14 @@ static int sys_venc_h265_init(int enc_w, int enc_h)
 
 	s32Ret = CVI_VENC_CreateChn(0, &stChnAttr);
 	if (s32Ret != CVI_SUCCESS) {
-		printf("[stream_demo] CVI_VENC_CreateChn failed 0x%x\n", s32Ret);
+		LOGE("CVI_VENC_CreateChn failed 0x%x\n", s32Ret);
 		return s32Ret;
 	}
 
 	/* Bind VPSS group 0 channel 0 -> VENC channel 0 */
 	s32Ret = SAMPLE_COMM_VPSS_Bind_VENC(0, 0, 0);
 	if (s32Ret != CVI_SUCCESS) {
-		printf("[stream_demo] VPSS_Bind_VENC failed 0x%x\n", s32Ret);
+		LOGE("VPSS_Bind_VENC failed 0x%x\n", s32Ret);
 		CVI_VENC_DestroyChn(0);
 		return s32Ret;
 	}
@@ -743,13 +718,13 @@ static int sys_venc_h265_init(int enc_w, int enc_h)
 	stRecvParam.s32RecvPicNum = -1;   /* encode indefinitely */
 	s32Ret = CVI_VENC_StartRecvFrame(0, &stRecvParam);
 	if (s32Ret != CVI_SUCCESS) {
-		printf("[stream_demo] StartRecvFrame failed 0x%x\n", s32Ret);
+		LOGE("StartRecvFrame failed 0x%x\n", s32Ret);
 		SAMPLE_COMM_VPSS_UnBind_VENC(0, 0, 0);
 		CVI_VENC_DestroyChn(0);
 		return s32Ret;
 	}
 
-	printf("[stream_demo] VENC H265 init OK\n");
+	LOGI("VENC H265 init OK\n");
 	return CVI_SUCCESS;
 }
 
@@ -775,11 +750,11 @@ int main(int argc, char *argv[])
 		enc_w = atoi(argv[1]);
 		enc_h = atoi(argv[2]);
 		if (enc_w <= 0 || enc_h <= 0) {
-			fprintf(stderr, "Usage: %s [enc_width enc_height]\n", argv[0]);
+			LOGE("Usage: %s [enc_width enc_height]\n", argv[0]);
 			return 1;
 		}
 	} else if (argc != 1) {
-		fprintf(stderr, "Usage: %s [enc_width enc_height]\n", argv[0]);
+		LOGE("Usage: %s [enc_width enc_height]\n", argv[0]);
 		return 1;
 	}
 
@@ -787,33 +762,31 @@ int main(int argc, char *argv[])
 	signal(SIGTERM, sig_handle);
 	signal(SIGPIPE, SIG_IGN);
 
-	printf("[stream_demo] starting, encode %dx%d H265\n", enc_w, enc_h);
-	fflush(stdout);
+	LOGI("starting, encode %dx%d H265 (log level=%d)\n", enc_w, enc_h, LOG_LEVEL);
 
 	/* 1. Start RTSP server */
 	if (rtsp_server_init(NULL, 8554) != 0) {
-		fprintf(stderr, "[stream_demo] rtsp_server_init failed\n");
+		LOGE("rtsp_server_init failed\n");
 		return 1;
 	}
 	if (rtsp_server_start() != 0) {
-		fprintf(stderr, "[stream_demo] rtsp_server_start failed\n");
+		LOGE("rtsp_server_start failed\n");
 		rtsp_server_deinit();
 		return 1;
 	}
-	printf("[stream_demo] RTSP URL: rtsp://%s:%d/live\n",
-	       rtsp_get_server_ip(), rtsp_get_server_port());
-	fflush(stdout);
+	LOGI("RTSP URL: rtsp://%s:%d/live\n",
+	     rtsp_get_server_ip(), rtsp_get_server_port());
 
 	/* 2. Init VI + VPSS */
 	if (sys_vi_init(enc_w, enc_h) != 0) {
-		fprintf(stderr, "[stream_demo] sys_vi_init failed\n");
+		LOGE("sys_vi_init failed\n");
 		ret = 1;
 		goto err_rtsp;
 	}
 
 	/* 3. Init VENC H265 */
 	if (sys_venc_h265_init(enc_w, enc_h) != 0) {
-		fprintf(stderr, "[stream_demo] sys_venc_h265_init failed\n");
+		LOGE("sys_venc_h265_init failed\n");
 		ret = 1;
 		goto err_vi;
 	}
@@ -827,18 +800,17 @@ int main(int argc, char *argv[])
 		uint64_t       last_us    = get_time_us();
 
 		if (venc_fd <= 0) {
-			fprintf(stderr, "[stream_demo] CVI_VENC_GetFd failed %d\n", venc_fd);
+			LOGE("CVI_VENC_GetFd failed %d\n", venc_fd);
 			ret = 1;
 			goto err_venc;
 		}
 
 		if (uart1_init(&uart_fd) == 0)
-			printf("[stream_demo] uart1 ready: /dev/ttyS1 460800 8N1 (A18/A19)\n");
+			LOGI("uart1 ready: /dev/ttyS1 460800 8N1 (A18/A19)\n");
 		else
-			fprintf(stderr, "[stream_demo] uart1 init failed, continue without uart\n");
+			LOGW("uart1 init failed, continue without uart\n");
 
-		printf("[stream_demo] entering encode/stream loop (fd=%d)\n", venc_fd);
-		fflush(stdout);
+		LOGI("entering encode/stream loop (fd=%d)\n", venc_fd);
 
 		while (!g_exit_flag) {
 			struct timeval tv;
@@ -859,7 +831,7 @@ int main(int argc, char *argv[])
 			sel = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
 			if (sel < 0) {
 				if (g_exit_flag) break;
-				perror("[stream_demo] select");
+				LOGP("select");
 				break;
 			}
 
@@ -886,9 +858,8 @@ int main(int argc, char *argv[])
 
 			if (CVI_VENC_GetStream(VencChn, &stStream, 1000) == CVI_SUCCESS) {
 				if (frame_count == 0) {
-					printf("[stream_demo] first H265 frame: %u packs\n",
-					       stStream.u32PackCount);
-					fflush(stdout);
+					LOGI("first H265 frame: %u packs\n",
+					     stStream.u32PackCount);
 				}
 				send_venc_stream(&stStream);
 				CVI_VENC_ReleaseStream(VencChn, &stStream);
@@ -898,17 +869,15 @@ int main(int argc, char *argv[])
 
 			uint64_t now = get_time_us();
 			if (frame_count % 100 == 0 && frame_count > 0) {
-				printf("[stream_demo] frame %llu  fps=%.1f\n",
-				       (unsigned long long)frame_count,
-				       100.0 * 1e6 / (double)(now - last_us));
-				fflush(stdout);
+				LOGI("frame %llu  fps=%.1f\n",
+				     (unsigned long long)frame_count,
+				     100.0 * 1e6 / (double)(now - last_us));
 				last_us = now;
 			}
 		}
 
-		printf("[stream_demo] shutting down after %llu frames\n",
-		       (unsigned long long)frame_count);
-		fflush(stdout);
+		LOGI("shutting down after %llu frames\n",
+		     (unsigned long long)frame_count);
 
 		uart1_deinit(uart_fd);
 	}

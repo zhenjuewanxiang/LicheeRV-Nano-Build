@@ -11,11 +11,12 @@ MW_SAMPLE := $(realpath $(SDIR)/../../middleware/v2/sample)
 MEDIA_SERVER := $(MW_SAMPLE)/test_mmf/media_server-1.0.1
 MAIX_MMF_DIR := $(MW_SAMPLE)/test_mmf
 
-TARGET := stream_demo
+TARGET := video_imu_mux
 
 # Source files
 SRCS := \
-	$(SDIR)/stream_demo.c \
+	$(SDIR)/video_imu_mux.c \
+	$(SDIR)/log.c \
 	$(SDIR)/imu.c \
 	$(MEDIA_SERVER)/libmov/test/mov-file-buffer.c
 

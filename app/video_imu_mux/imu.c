@@ -1,4 +1,6 @@
+#define STREAM_LOG_MODULE STREAM_LOG_MODULE_IMU
 #include "imu.h"
+#include "log.h"
 
 #include <stdlib.h>
 #include <string.h>
