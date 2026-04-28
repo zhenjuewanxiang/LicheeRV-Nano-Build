@@ -32,8 +32,126 @@
 static volatile int            g_exit_flag = 0;
 static SAMPLE_VI_CONFIG_S      g_stViConfig;
 static SAMPLE_INI_CFG_S        g_stIniCfg;
-static uint8_t                 g_sei_fill_value = 0;
 static imu_parser_t           *g_imu_parser = NULL;
+
+/* ------------------------------------------------------------------ */
+/* IMU ring buffer for high-precision frame sync                       */
+/* Stores the last IMU_RING_SIZE samples with their CLOCK_MONOTONIC    */
+/* capture timestamps so we can interpolate to any frame PTS.          */
+/* The loop is single-threaded (select on venc_fd + uart_fd), so no    */
+/* mutex is required.                                                  */
+/* ------------------------------------------------------------------ */
+#define IMU_RING_SIZE  64
+
+typedef struct {
+	uint64_t   capture_us; /* CLOCK_MONOTONIC µs when bytes arrived */
+	imu_tilt_t tilt;
+} imu_sample_t;
+
+static imu_sample_t g_imu_ring[IMU_RING_SIZE];
+static int          g_imu_ring_head  = 0; /* next write slot */
+static int          g_imu_ring_count = 0; /* valid entries   */
+
+/*
+ * Clock-domain calibration: offset_us = CLOCK_MONOTONIC_us - imu_system_time_us
+ * Computed once at the first received IMU packet and held constant.
+ * Converts any imu_tilt_t.system_time to CLOCK_MONOTONIC µs:
+ *   capture_us = (uint64_t)(system_time * 1e6) + g_imu_clk_offset_us
+ */
+static int64_t  g_imu_clk_offset_us    = 0;
+static int      g_imu_clk_offset_valid = 0;
+
+/* Forward declaration — defined in Helpers section below. */
+static uint64_t get_time_us(void);
+
+/* Push a new sample into the ring (overwrites oldest when full).
+ * capture_us must already be in CLOCK_MONOTONIC µs domain. */
+static void imu_ring_push(const imu_tilt_t *tilt, uint64_t capture_us)
+{
+	g_imu_ring[g_imu_ring_head].capture_us = capture_us;
+	g_imu_ring[g_imu_ring_head].tilt       = *tilt;
+	g_imu_ring_head = (g_imu_ring_head + 1) % IMU_RING_SIZE;
+	if (g_imu_ring_count < IMU_RING_SIZE)
+		g_imu_ring_count++;
+}
+
+/*
+ * Interpolate (or clamp-extrapolate) the IMU ring buffer to target_us.
+ *
+ * Iterates from oldest to newest entry.  Finds the two adjacent samples
+ * that bracket target_us and linearly interpolates between them.
+ * If target_us is outside the buffered range the nearest endpoint is used.
+ *
+ * Returns 0 on success, -1 when the ring is empty.
+ * On success *residual_us receives the distance to the nearest sample
+ * (0 when perfectly between two samples, positive when extrapolating).
+ */
+static int imu_ring_interpolate(uint64_t target_us, imu_tilt_t *out,
+                                uint32_t *residual_us)
+{
+	int count = g_imu_ring_count;
+	int oldest, i;
+	int prev_idx = -1, next_idx = -1;
+
+	if (count == 0)
+		return -1;
+
+	/* Oldest slot: if buffer not full it starts at 0; otherwise at head. */
+	oldest = (count < IMU_RING_SIZE) ? 0 : g_imu_ring_head;
+
+	/* Find bracketing pair. */
+	for (i = 0; i < count; i++) {
+		int idx = (oldest + i) % IMU_RING_SIZE;
+
+		if (g_imu_ring[idx].capture_us <= target_us)
+			prev_idx = idx;
+		else {
+			next_idx = idx;
+			break;
+		}
+	}
+
+	if (prev_idx < 0) {
+		/* target is before all samples — clamp to oldest */
+		*out = g_imu_ring[oldest % IMU_RING_SIZE].tilt;
+		*residual_us = (uint32_t)(g_imu_ring[oldest % IMU_RING_SIZE].capture_us
+		                          - target_us);
+		return 0;
+	}
+	if (next_idx < 0) {
+		/* target is after all samples — clamp to newest */
+		int newest = (g_imu_ring_head - 1 + IMU_RING_SIZE) % IMU_RING_SIZE;
+		*out = g_imu_ring[newest].tilt;
+		*residual_us = (uint32_t)(target_us
+		                          - g_imu_ring[newest].capture_us);
+		return 0;
+	}
+
+	/* Linear interpolation between prev and next. */
+	{
+		uint64_t t0    = g_imu_ring[prev_idx].capture_us;
+		uint64_t t1    = g_imu_ring[next_idx].capture_us;
+		double   alpha = (t1 > t0) ?
+		                 (double)(target_us - t0) / (double)(t1 - t0) : 0.0;
+		const imu_tilt_t *a = &g_imu_ring[prev_idx].tilt;
+		const imu_tilt_t *b = &g_imu_ring[next_idx].tilt;
+
+#define LERP(f) (float)((a->f) + alpha * ((b->f) - (a->f)))
+		out->pitch       = LERP(pitch);
+		out->roll        = LERP(roll);
+		out->yaw         = LERP(yaw);
+		out->gyro[0]     = LERP(gyro[0]);
+		out->gyro[1]     = LERP(gyro[1]);
+		out->gyro[2]     = LERP(gyro[2]);
+		out->temperature = LERP(temperature);
+#undef LERP
+		out->status   = a->status;   /* discrete — nearest (prev) */
+		out->has_accel = a->has_accel;
+		out->has_quat  = a->has_quat;
+		*residual_us  = 0;
+	}
+	return 0;
+}
 
 static void sig_handle(int signo)
 {
@@ -72,23 +190,64 @@ static void imu_packet_print(const imu_packet_t *t_pkt, void *t_user)
 	if (imu_decode_tilt(t_pkt, &tilt) != 0)
 		return;
 
-	printf("[imu] time=%.3f status=%u\n",
-	       tilt.system_time, tilt.status);
-	printf("[imu] gyro=%.4f %.4f %.4f deg/s\n",
-	       tilt.gyro[0], tilt.gyro[1], tilt.gyro[2]);
-	if (tilt.has_accel) {
-		printf("[imu] accel=%.4f %.4f %.4f m/s^2\n",
-		       tilt.accel[0], tilt.accel[1], tilt.accel[2]);
+	/* Convert IMU system_time to CLOCK_MONOTONIC µs via calibrated offset.
+	 * On the first packet, compute offset = mono_now - imu_now. */
+	{
+		uint64_t imu_us   = (uint64_t)(tilt.system_time * 1e6);
+		uint64_t mono_now = get_time_us();
+		uint64_t capture_us;
+
+		/* Dynamic EMA offset: tracks clock drift between IMU oscillator
+		 * and Linux CLOCK_MONOTONIC.  Both devices start from 0 at power-on
+		 * so the raw difference is approximately the UART pipeline delay.
+		 * α = 1/100 ≈ 0.01  →  time constant ≈ 100 packets (~1 s at 100 Hz).
+		 * Integer-only arithmetic: new = old + (raw - old) / 100            */
+		{
+			int64_t raw_offset = (int64_t)mono_now - (int64_t)imu_us;
+			if (!g_imu_clk_offset_valid) {
+				g_imu_clk_offset_us    = raw_offset;
+				g_imu_clk_offset_valid = 1;
+			} else {
+				g_imu_clk_offset_us = g_imu_clk_offset_us
+				                    + (raw_offset - g_imu_clk_offset_us) / 100;
+			}
+		}
+		capture_us = (uint64_t)((int64_t)imu_us + g_imu_clk_offset_us);
+		imu_ring_push(&tilt, capture_us);
+
+		/* Print raw times once per second for clock-domain verification. */
+		{
+			static uint64_t last_print_us = 0;
+			if (mono_now - last_print_us >= 1000000ULL) {
+				int64_t raw_now = (int64_t)mono_now - (int64_t)imu_us;
+				last_print_us = mono_now;
+				printf("[sync-dbg] mono=%llu  imu=%llu  raw_diff=%lld  ema_offset=%lld us\n",
+				       (unsigned long long)mono_now,
+				       (unsigned long long)imu_us,
+				       (long long)raw_now,
+				       (long long)g_imu_clk_offset_us);
+				fflush(stdout);
+			}
+		}
 	}
-	printf("[imu] euler pitch=%.4f roll=%.4f yaw=%.4f deg\n",
-	       tilt.pitch, tilt.roll, tilt.yaw);
-	if (tilt.has_quat) {
-		printf("[imu] temp=%.3f C quat=%.6f %.6f %.6f %.6f\n",
-		       tilt.temperature,
-		       tilt.quat[0], tilt.quat[1], tilt.quat[2], tilt.quat[3]);
-	} else {
-		printf("[imu] temp=%.3f C\n", tilt.temperature);
-	}
+
+	// printf("[imu] time=%.3f status=%u\n",
+	//        tilt.system_time, tilt.status);
+	// printf("[imu] gyro=%.4f %.4f %.4f deg/s\n",
+	//        tilt.gyro[0], tilt.gyro[1], tilt.gyro[2]);
+	// if (tilt.has_accel) {
+	// 	printf("[imu] accel=%.4f %.4f %.4f m/s^2\n",
+	// 	       tilt.accel[0], tilt.accel[1], tilt.accel[2]);
+	// }
+	// printf("[imu] euler pitch=%.4f roll=%.4f yaw=%.4f deg\n",
+	//        tilt.pitch, tilt.roll, tilt.yaw);
+	// if (tilt.has_quat) {
+	// 	printf("[imu] temp=%.3f C quat=%.6f %.6f %.6f %.6f\n",
+	// 	       tilt.temperature,
+	// 	       tilt.quat[0], tilt.quat[1], tilt.quat[2], tilt.quat[3]);
+	// } else {
+	// 	printf("[imu] temp=%.3f C\n", tilt.temperature);
+	// }
 	fflush(stdout);
 }
 
@@ -166,7 +325,7 @@ static void uart1_handle_rx_tx(int t_uart_fd)
 		return;
 	}
 
-	printf("[stream_demo] uart1 rx %zd bytes\r\n", rx_len);
+	// printf("[stream_demo] uart1 rx %zd bytes\r\n", rx_len);
 	if (g_imu_parser)
 		imu_parser_feed(g_imu_parser, (const uint8_t *)rx_buf, (size_t)rx_len);
 }
@@ -179,49 +338,156 @@ static int is_h265_vcl_nalu(H265E_NALU_TYPE_E enType)
 	       enType == H265E_NALU_IDRSLICE;
 }
 
-static size_t build_h265_prefix_sei(uint8_t *dst, size_t dst_size, uint8_t fill_value)
+/*
+ * Build H.265 prefix SEI carrying an IMU snapshot interpolated to frame_pts_us.
+ *
+ * frame_pts_us: hardware frame PTS in CLOCK_MONOTONIC µs (from pstPack[0].u64PTS).
+ *
+ * Annex-B NAL layout:
+ *   [0..3]   start code (0x00 0x00 0x00 0x01)
+ *   [4]      nal_type byte: (39 << 1) = 0x4E (prefix_sei)
+ *   [5]      temporal_id_plus1 = 0x01
+ *   [6..8]   SEI message header:
+ *     [6]    payload_type = 5 (user_data_unregistered)
+ *     [7]    payload_size = 0xFF (+ [8]=0x01 → 256 bytes)
+ *   [9..264] SEI payload (256 bytes):
+ *     [0..3]    frame_pts_ms      uint32 BE  — frame hardware PTS (ms)
+ *     [4]       imu_valid         uint8      — 1 if interpolation succeeded
+ *     [5..8]    imu_residual_us   uint32 BE  — bracket residual (µs)
+ *     [9..12]   pitch             float32 LE (deg)
+ *     [13..16]  roll              float32 LE (deg)
+ *     [17..20]  yaw               float32 LE (deg)
+ *     [21..24]  gyro[0]           float32 LE (deg/s)
+ *     [25..28]  gyro[1]           float32 LE (deg/s)
+ *     [29..32]  gyro[2]           float32 LE (deg/s)
+ *     [33..36]  temperature       float32 LE (°C)
+ *     [37]      status            uint8
+ *     [38..255] reserved          (zeros)
+ */
+static size_t build_h265_prefix_sei(uint8_t *dst, size_t dst_size,
+                                    uint64_t frame_pts_us)
 {
-	uint8_t rbsp[260];
-	size_t rbsp_len = 0;
+	uint8_t payload[256];
+	uint8_t sei_rbsp[1 + 4 + 16 + 256 + 1]; /* type + size(<=4 bytes enough) + data + rbsp_trailing_bits */
+	static const uint8_t k_sei_uuid[16] = {
+		0xAA, 0xAA, 0xAA, 0xAA, 0xBB, 0xBB, 0xBB, 0xBB,
+		0xCC, 0xCC, 0xCC, 0xCC, 0xDD, 0xDD, 0xDD, 0xDD
+	};
 	size_t out = 0;
-	uint32_t now_ms = (uint32_t)(get_time_us() / 1000ULL);
+	size_t rbsp_len = 0;
+	size_t i;
 	int zero_count = 0;
-	int i;
+	int payload_size = 16 + (int)sizeof(payload);
+	int remain;
 
-	if (dst_size < 512)
+	if (!dst || dst_size < 64)
 		return 0;
 
-	/* payload_type = 5 (user_data_unregistered style custom payload) */
-	rbsp[rbsp_len++] = 5;
-	/* payload_size = 256 => 0xFF, 0x01 */
-	rbsp[rbsp_len++] = 0xFF;
-	rbsp[rbsp_len++] = 0x01;
-	rbsp[rbsp_len++] = (uint8_t)((now_ms >> 24) & 0xFF);
-	rbsp[rbsp_len++] = (uint8_t)((now_ms >> 16) & 0xFF);
-	rbsp[rbsp_len++] = (uint8_t)((now_ms >> 8) & 0xFF);
-	rbsp[rbsp_len++] = (uint8_t)(now_ms & 0xFF);
-	for (i = 4; i < 256; i++)
-		rbsp[rbsp_len++] = fill_value;
-	/* rbsp_trailing_bits() */
-	rbsp[rbsp_len++] = 0x80;
+	memset(payload, 0, sizeof(payload));
+	memset(sei_rbsp, 0, sizeof(sei_rbsp));
 
-	/* Annex-B start code */
+	/* Build payload using TH264SEI layout (249 bytes), remaining bytes keep zero.
+	 * struct layout:
+	 *   [0..3]   Head    = 0x01000000 (little-endian bytes: 00 00 00 01)
+	 *   [4]      sei     = 0x06
+	 *   [5]      seitype = 0x05
+	 *   [6]      len     = 242 (uuid + type + union(224) + ends)
+	 *   [7..22]  uuid[16]
+	 *   [23]     type    = 2 (SEI_PAYLOAD_TYPE_XYZ)
+	 *   [24..247] union  = jStr[224]
+	 *   [248]    ends    = 0x80 */
+	payload[0] = 0x00;
+	payload[1] = 0x00;
+	payload[2] = 0x00;
+	payload[3] = 0x01;
+	payload[4] = 0x06;
+	payload[5] = 0x05;
+	payload[6] = 242;
+	memcpy(&payload[7], k_sei_uuid, sizeof(k_sei_uuid));
+	payload[23] = 2;
+
+	/* Fill union.jStr[224] with frame/IMU fields.
+	 * jStr offsets below are relative to payload[24]. */
+	{
+		imu_tilt_t imu;
+		uint32_t   residual_us = 0;
+		uint32_t pts_ms = (uint32_t)(frame_pts_us / 1000ULL);
+
+		/* Debug: verify PTS vs ring head timing.
+		 * newest_us should be slightly >= frame_pts_us for perfect bracketing.
+		 * Remove once timing is confirmed correct. */
+		if (g_imu_ring_count > 0) {
+			int newest = (g_imu_ring_head - 1 + IMU_RING_SIZE) % IMU_RING_SIZE;
+			uint64_t newest_us = g_imu_ring[newest].capture_us;
+			int64_t  diff_us   = (int64_t)newest_us - (int64_t)frame_pts_us;
+			printf("[sync] frame_pts_us=%llu newest_imu_us=%llu diff=%lld us\n",
+			       (unsigned long long)frame_pts_us,
+			       (unsigned long long)newest_us,
+			       (long long)diff_us);
+			fflush(stdout);
+		}
+
+		if (imu_ring_interpolate(frame_pts_us, &imu, &residual_us) == 0) {
+			payload[24] = (uint8_t)((pts_ms >> 24) & 0xFF);
+			payload[25] = (uint8_t)((pts_ms >> 16) & 0xFF);
+			payload[26] = (uint8_t)((pts_ms >>  8) & 0xFF);
+			payload[27] = (uint8_t)( pts_ms        & 0xFF);
+			payload[28] = 1;  /* imu_valid */
+			payload[29] = (uint8_t)((residual_us >> 24) & 0xFF);
+			payload[30] = (uint8_t)((residual_us >> 16) & 0xFF);
+			payload[31] = (uint8_t)((residual_us >>  8) & 0xFF);
+			payload[32] = (uint8_t)( residual_us        & 0xFF);
+			memcpy(&payload[33], &imu.pitch,       4);
+			memcpy(&payload[37], &imu.roll,        4);
+			memcpy(&payload[41], &imu.yaw,         4);
+			memcpy(&payload[45], &imu.gyro[0],     4);
+			memcpy(&payload[49], &imu.gyro[1],     4);
+			memcpy(&payload[53], &imu.gyro[2],     4);
+			memcpy(&payload[57], &imu.temperature, 4);
+			payload[61] = imu.status;
+		}
+	}
+	payload[248] = 0x80;
+
+	/* Build RBSP (without start code / NAL header). */
+	sei_rbsp[rbsp_len++] = 5;  /* payload_type: user_data_unregistered */
+
+	remain = payload_size;
+	while (remain >= 0xFF) {
+		sei_rbsp[rbsp_len++] = 0xFF;
+		remain -= 0xFF;
+	}
+	sei_rbsp[rbsp_len++] = (uint8_t)remain;
+
+	memcpy(&sei_rbsp[rbsp_len], k_sei_uuid, sizeof(k_sei_uuid));
+	rbsp_len += sizeof(k_sei_uuid);
+	memcpy(&sei_rbsp[rbsp_len], payload, sizeof(payload));
+	rbsp_len += sizeof(payload);
+	sei_rbsp[rbsp_len++] = 0x80; /* rbsp_trailing_bits */
+
+	/* Annex-B start code + NAL header (must not be emulation-protected). */
+	if (dst_size < 6)
+		return 0;
 	dst[out++] = 0x00;
 	dst[out++] = 0x00;
 	dst[out++] = 0x00;
 	dst[out++] = 0x01;
-	/* nal_unit_type = 39 (prefix_sei), nuh_layer_id = 0, temporal_id_plus1 = 1 */
-	dst[out++] = 39 << 1;
-	dst[out++] = 0x01;
+	dst[out++] = 39 << 1; /* nal_unit_type = 39 (prefix_sei), nuh_layer_id = 0 */
+	dst[out++] = 0x01;    /* temporal_id_plus1 = 1 */
 
-	for (i = 0; i < (int)rbsp_len; i++) {
-		uint8_t b = rbsp[i];
+	/* Emulation prevention over RBSP bytes only. */
+	for (i = 0; i < rbsp_len; i++) {
+		uint8_t b = sei_rbsp[i];
 
 		if (zero_count >= 2 && b <= 0x03) {
+			if (out >= dst_size)
+				return 0;
 			dst[out++] = 0x03;
 			zero_count = 0;
 		}
 
+		if (out >= dst_size)
+			return 0;
 		dst[out++] = b;
 		if (b == 0x00)
 			zero_count++;
@@ -238,7 +504,12 @@ static void send_venc_stream(VENC_STREAM_S *pstStream)
 	CVI_U32 i;
 	int sei_sent = 0;
 	uint8_t sei_nal[512];
-	size_t sei_len = build_h265_prefix_sei(sei_nal, sizeof(sei_nal), g_sei_fill_value);
+	/* Use the hardware PTS of the first pack as the frame capture time.
+	 * u64PTS is in µs on the same CLOCK_MONOTONIC domain as get_time_us(). */
+	uint64_t frame_pts_us = (pstStream->u32PackCount > 0)
+	                        ? pstStream->pstPack[0].u64PTS
+	                        : get_time_us();
+	size_t sei_len = build_h265_prefix_sei(sei_nal, sizeof(sei_nal), frame_pts_us);
 
 	if (pstStream->u32PackCount == 0)
 		return;
@@ -260,8 +531,6 @@ static void send_venc_stream(VENC_STREAM_S *pstStream)
 
 	if (!sei_sent && sei_len > 0)
 		rtsp_send_h265_data(sei_nal, sei_len);
-
-	g_sei_fill_value++;
 }
 
 /* ------------------------------------------------------------------ */
