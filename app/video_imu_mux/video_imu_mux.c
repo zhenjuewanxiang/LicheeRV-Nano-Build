@@ -29,6 +29,10 @@
 #include "sample_comm.h"
 #include "rtsp-server.h"
 #include "cvi_audio.h"
+#include "mov-writer.h"
+#include "mov-file-buffer.h"
+#include "mov-format.h"
+#include "mpeg4-hevc.h"
 
 /* ------------------------------------------------------------------ */
 /* Global state                                                        */
@@ -59,12 +63,6 @@ static imu_parser_t           *g_imu_parser = NULL;
 /* Local video file recording                                         */
 /* Raw Annex-B H.265 files, split at VIDEO_FILE_SIZE_LIMIT bytes.     */
 /* ------------------------------------------------------------------ */
-#define VIDEO_FILE_DIR        "/mnt/data/video"
-#define VIDEO_FILE_SIZE_LIMIT (10 * 1024 * 1024)  /* 10 MB */
-
-static FILE  *g_video_file       = NULL;
-static size_t g_video_file_bytes = 0;
-static int    g_video_file_idx   = 0;
 
 static uint8_t g_imu_buf[IMU_BUF_SIZE][IMU_PKT_WIRE_SIZE];
 static int     g_imu_count = 0;
@@ -95,8 +93,10 @@ static int  capture_pending_frame(VENC_CHN t_chn);
 static void release_pending_frame(void);
 static void drain_venc(VENC_CHN t_chn);
 static int  try_send_pending_frame(void);
-static void video_file_write(const uint8_t *t_data, size_t t_len);
-static void video_file_close(void);
+static void container_write_video(const uint8_t *annexb, size_t len, int64_t pts_us);
+static void container_write_audio(const uint8_t *data, size_t len, int64_t pts_us);
+static void container_open(void);
+static void container_close(void);
 
 
 static void sig_handle(int signo)
@@ -427,16 +427,43 @@ static int try_send_pending_frame(void)
 
 	g_imu_count = 0;
 
-	rtsp_send_h265_data(sei_nal, sei_len);
-	video_file_write(sei_nal, sei_len);
+	/* Assemble the full Annex-B frame (SEI prefix + video NALUs) into
+	 * a flat buffer so h265_annexbtomp4() can process it in one pass. */
+	{
+		size_t frame_len = sei_len;
+		uint8_t *frame_buf;
+		size_t off;
 
+		for (i = 0; i < g_pending_frame.pack_count; i++)
+			frame_len += g_pending_frame.packs[i].length;
+
+		frame_buf = (uint8_t *)malloc(frame_len);
+		if (frame_buf) {
+			memcpy(frame_buf, sei_nal, sei_len);
+			off = sei_len;
+			for (i = 0; i < g_pending_frame.pack_count; i++) {
+				size_t plen = g_pending_frame.packs[i].length;
+				if (plen > 0) {
+					memcpy(frame_buf + off,
+					       g_pending_frame.data + g_pending_frame.packs[i].offset,
+					       plen);
+					off += plen;
+				}
+			}
+			container_write_video(frame_buf, frame_len,
+					      (int64_t)g_pending_frame.pts);
+			free(frame_buf);
+		}
+	}
+
+	/* RTSP stream: send SEI + video NALUs as before (Annex-B) */
+	rtsp_send_h265_data(sei_nal, sei_len);
 	for (i = 0; i < g_pending_frame.pack_count; i++) {
 		size_t len = g_pending_frame.packs[i].length;
 		if (len > 0) {
 			uint8_t *ptr =
 			    g_pending_frame.data + g_pending_frame.packs[i].offset;
 			rtsp_send_h265_data(ptr, len);
-			video_file_write(ptr, len);
 		}
 	}
 
@@ -447,117 +474,151 @@ static int try_send_pending_frame(void)
 	return 1;
 }
 
-/* Open the next numbered file for recording. */
-static void video_file_open_next(void)
-{
-	char path[128];
-
-	mkdir(VIDEO_FILE_DIR, 0755);
-	snprintf(path, sizeof(path), "%s/video_%04d.h265",
-	         VIDEO_FILE_DIR, g_video_file_idx++);
-	g_video_file = fopen(path, "wb");
-	if (!g_video_file) {
-		LOGW("cannot open video file %s: %s\n", path, strerror(errno));
-		return;
-	}
-	g_video_file_bytes = 0;
-	LOGI("recording to %s\n", path);
-}
-
-/* Write data to the current recording file, opening or rotating as needed. */
-static void video_file_write(const uint8_t *t_data, size_t t_len)
-{
-	if (!t_data || t_len == 0)
-		return;
-
-	if (!g_video_file)
-		video_file_open_next();
-
-	if (!g_video_file)
-		return;
-
-	fwrite(t_data, 1, t_len, g_video_file);
-	g_video_file_bytes += t_len;
-
-	if (g_video_file_bytes >= VIDEO_FILE_SIZE_LIMIT) {
-		fclose(g_video_file);
-		g_video_file = NULL;
-		LOGI("video file closed at %zu bytes, starting next\n",
-		     g_video_file_bytes);
-	}
-}
-
-static void video_file_close(void)
-{
-	if (g_video_file) {
-		fclose(g_video_file);
-		g_video_file = NULL;
-		LOGI("video file closed (%zu bytes)\n", g_video_file_bytes);
-	}
-}
 
 
 /* ------------------------------------------------------------------ */
-/* Audio recording (AI -> AENC G711A, saved alongside video files)    */
+/* MP4 container (H.265 video + G711A audio in one file)              */
 /* ------------------------------------------------------------------ */
-#define AUDIO_SAMPLE_RATE  8000   /* Hz */
-#define AUDIO_PT_NUM       320    /* samples per frame = 40 ms at 8 kHz */
+#define AUDIO_SAMPLE_RATE     8000
+#define AUDIO_PT_NUM          320    /* 40 ms at 8 kHz */
+#define CONTAINER_FILE_DIR    "/mnt/data/video"
+#define CONTAINER_SIZE_LIMIT  (50 * 1024 * 1024)  /* 50 MB per file */
 
-static FILE           *g_audio_file  = NULL;
+static mov_writer_t       *g_mov           = NULL;
+static FILE               *g_mov_fp        = NULL;
+static int                 g_mov_video_trk = -1;
+static int                 g_mov_audio_trk = -1;
+static int                 g_mov_file_idx  = 0;
+static size_t              g_mov_bytes     = 0;
+static pthread_mutex_t     g_mov_lock      = PTHREAD_MUTEX_INITIALIZER;
+static struct mpeg4_hevc_t g_hevc;
+static int                 g_enc_w         = 0;
+static int                 g_enc_h         = 0;
+
 static pthread_t       g_audio_thread;
 static volatile int    g_audio_stop  = 0;
 
-static void audio_file_open(int idx)
+/* Open a new MP4 file.  Called with g_mov_lock held. */
+static void container_open(void)
 {
 	char path[128];
 
-	snprintf(path, sizeof(path), "%s/audio_%04d.g711a",
-	         VIDEO_FILE_DIR, idx);
-	g_audio_file = fopen(path, "wb");
-	if (!g_audio_file)
-		LOGW("cannot open audio file %s: %s\n", path, strerror(errno));
-	else
-		LOGI("audio recording to %s\n", path);
-}
-
-static void audio_file_close(void)
-{
-	if (g_audio_file) {
-		fclose(g_audio_file);
-		g_audio_file = NULL;
+	mkdir(CONTAINER_FILE_DIR, 0755);
+	snprintf(path, sizeof(path), "%s/record_%04d.mp4",
+	         CONTAINER_FILE_DIR, g_mov_file_idx++);
+	g_mov_fp = fopen(path, "wb");
+	if (!g_mov_fp) {
+		LOGW("cannot open container %s: %s\n", path, strerror(errno));
+		return;
 	}
+	g_mov = mov_writer_create(mov_file_buffer(), g_mov_fp, 0);
+	if (!g_mov) {
+		LOGW("mov_writer_create failed\n");
+		fclose(g_mov_fp);
+		g_mov_fp = NULL;
+		return;
+	}
+	/* Audio track needs no extra_data for G711A */
+	g_mov_audio_trk = mov_writer_add_audio(g_mov, MOV_OBJECT_G711a,
+	                                        1, 16, AUDIO_SAMPLE_RATE, NULL, 0);
+	g_mov_video_trk = -1;
+	g_mov_bytes     = 0;
+	memset(&g_hevc, 0, sizeof(g_hevc));
+	LOGI("recording to %s\n", path);
 }
 
-/* Audio capture thread: drains AENC stream and writes to file.
- * File rotation is tied to video file rotation: when g_video_file_idx
- * increments (a new video_NNNN.h265 was opened), a matching
- * audio_NNNN.g711a is opened. */
+/* Close and finalise the current MP4 file.  Called with g_mov_lock held. */
+static void container_close(void)
+{
+	if (g_mov) {
+		mov_writer_destroy(g_mov);
+		g_mov = NULL;
+	}
+	if (g_mov_fp) {
+		fclose(g_mov_fp);
+		g_mov_fp = NULL;
+	}
+	g_mov_video_trk = -1;
+	g_mov_audio_trk = -1;
+}
+
+/* Convert Annex-B H.265 frame to AVCC and write to the container.
+ * annexb must contain a complete frame (SEI + video NALUs). */
+static void container_write_video(const uint8_t *annexb, size_t len,
+				   int64_t pts_us)
+{
+	static uint8_t s_conv[2 * 1024 * 1024];
+	int vcl = 0, update = 0, n;
+
+	n = h265_annexbtomp4(&g_hevc, annexb, len,
+	                     s_conv, sizeof(s_conv), &vcl, &update);
+	if (n <= 0)
+		return;
+
+	pthread_mutex_lock(&g_mov_lock);
+
+	if (!g_mov)
+		container_open();
+
+	if (g_mov && update && g_hevc.configurationVersion == 1 && g_mov_video_trk < 0) {
+		uint8_t cfg[1024];
+		int cfg_len = mpeg4_hevc_decoder_configuration_record_save(
+			&g_hevc, cfg, sizeof(cfg));
+		if (cfg_len > 0)
+			g_mov_video_trk = mov_writer_add_video(
+				g_mov, MOV_OBJECT_H265,
+				g_enc_w, g_enc_h, cfg, (size_t)cfg_len);
+	}
+
+	if (g_mov && g_mov_video_trk >= 0 && vcl) {
+		int64_t ts = pts_us / 1000;
+		int flags  = update ? MOV_AV_FLAG_KEYFREAME : 0;
+		mov_writer_write(g_mov, g_mov_video_trk,
+		                 s_conv, (size_t)n, ts, ts, flags);
+		g_mov_bytes += (size_t)n;
+	}
+
+	if (g_mov_bytes >= CONTAINER_SIZE_LIMIT) {
+		LOGI("container closed at %zu bytes, rotating\n", g_mov_bytes);
+		container_close();
+	}
+
+	pthread_mutex_unlock(&g_mov_lock);
+}
+
+/* Write a G711A audio frame to the container. */
+static void container_write_audio(const uint8_t *data, size_t len,
+				   int64_t pts_us)
+{
+	if (!data || len == 0)
+		return;
+
+	pthread_mutex_lock(&g_mov_lock);
+
+	if (g_mov && g_mov_audio_trk >= 0) {
+		int64_t ts = pts_us / 1000;
+		mov_writer_write(g_mov, g_mov_audio_trk, data, len, ts, ts, 0);
+	}
+
+	pthread_mutex_unlock(&g_mov_lock);
+}
+
+/* Audio capture thread: drains AENC, feeds container_write_audio(). */
 static void *audio_capture_thread(void *arg)
 {
-	int last_video_idx = 0;
-
 	(void)arg;
 
 	while (!g_audio_stop) {
-		int cur = g_video_file_idx;
-
-		if (cur != last_video_idx && cur > 0) {
-			audio_file_close();
-			audio_file_open(cur - 1);
-			last_video_idx = cur;
-		}
-
 		AUDIO_STREAM_S stStream = {};
 		CVI_S32 ret = CVI_AENC_GetStream(0, &stStream, 40);
 		if (ret == CVI_SUCCESS) {
-			if (g_audio_file && stStream.pStream && stStream.u32Len > 0)
-				fwrite(stStream.pStream, 1,
-				       (size_t)stStream.u32Len, g_audio_file);
+			if (stStream.pStream && stStream.u32Len > 0)
+				container_write_audio(stStream.pStream,
+					(size_t)stStream.u32Len,
+					(int64_t)stStream.u64TimeStamp);
 			CVI_AENC_ReleaseStream(0, &stStream);
 		}
 	}
-
-	audio_file_close();
 	return NULL;
 }
 
@@ -915,6 +976,8 @@ int main(int argc, char *argv[])
 		LOGE("Usage: %s [enc_width enc_height]\n", argv[0]);
 		return 1;
 	}
+	g_enc_w = enc_w;
+	g_enc_h = enc_h;
 
 	signal(SIGINT,  sig_handle);
 	signal(SIGTERM, sig_handle);
@@ -1027,11 +1090,14 @@ int main(int argc, char *argv[])
 		     (unsigned long long)frame_count);
 
 		release_pending_frame();
-		video_file_close();
 		uart1_deinit(uart_fd);
 	}
 
 	sys_audio_deinit();
+
+	pthread_mutex_lock(&g_mov_lock);
+	container_close();
+	pthread_mutex_unlock(&g_mov_lock);
 err_venc:
 	sys_venc_deinit();
 err_vi:
