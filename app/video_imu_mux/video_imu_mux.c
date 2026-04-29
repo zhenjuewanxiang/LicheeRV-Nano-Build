@@ -52,6 +52,17 @@ static imu_parser_t           *g_imu_parser = NULL;
 #define IMU_BUF_SIZE   16   /* accumulation limit; reset to 0 when reached */
 #define IMU_PKT_WIRE_SIZE 28
 
+/* ------------------------------------------------------------------ */
+/* Local video file recording                                         */
+/* Raw Annex-B H.265 files, split at VIDEO_FILE_SIZE_LIMIT bytes.     */
+/* ------------------------------------------------------------------ */
+#define VIDEO_FILE_DIR        "/mnt/data/video"
+#define VIDEO_FILE_SIZE_LIMIT (10 * 1024 * 1024)  /* 10 MB */
+
+static FILE  *g_video_file       = NULL;
+static size_t g_video_file_bytes = 0;
+static int    g_video_file_idx   = 0;
+
 static uint8_t g_imu_buf[IMU_BUF_SIZE][IMU_PKT_WIRE_SIZE];
 static int     g_imu_count = 0;
 
@@ -81,6 +92,8 @@ static int  capture_pending_frame(VENC_CHN t_chn);
 static void release_pending_frame(void);
 static void drain_venc(VENC_CHN t_chn);
 static int  try_send_pending_frame(void);
+static void video_file_write(const uint8_t *t_data, size_t t_len);
+static void video_file_close(void);
 
 
 static void sig_handle(int signo)
@@ -412,13 +425,16 @@ static int try_send_pending_frame(void)
 	g_imu_count = 0;
 
 	rtsp_send_h265_data(sei_nal, sei_len);
+	video_file_write(sei_nal, sei_len);
 
 	for (i = 0; i < g_pending_frame.pack_count; i++) {
 		size_t len = g_pending_frame.packs[i].length;
-		if (len > 0)
-			rtsp_send_h265_data(
-			    g_pending_frame.data + g_pending_frame.packs[i].offset,
-			    len);
+		if (len > 0) {
+			uint8_t *ptr =
+			    g_pending_frame.data + g_pending_frame.packs[i].offset;
+			rtsp_send_h265_data(ptr, len);
+			video_file_write(ptr, len);
+		}
 	}
 
 	LOGT("sent frame pts=%llu with %d imu pkts\n",
@@ -426,6 +442,54 @@ static int try_send_pending_frame(void)
 
 	release_pending_frame();
 	return 1;
+}
+
+/* Open the next numbered file for recording. */
+static void video_file_open_next(void)
+{
+	char path[128];
+
+	snprintf(path, sizeof(path), "%s/video_%04d.h265",
+	         VIDEO_FILE_DIR, g_video_file_idx++);
+	g_video_file = fopen(path, "wb");
+	if (!g_video_file) {
+		LOGW("cannot open video file %s: %s\n", path, strerror(errno));
+		return;
+	}
+	g_video_file_bytes = 0;
+	LOGI("recording to %s\n", path);
+}
+
+/* Write data to the current recording file, opening or rotating as needed. */
+static void video_file_write(const uint8_t *t_data, size_t t_len)
+{
+	if (!t_data || t_len == 0)
+		return;
+
+	if (!g_video_file)
+		video_file_open_next();
+
+	if (!g_video_file)
+		return;
+
+	fwrite(t_data, 1, t_len, g_video_file);
+	g_video_file_bytes += t_len;
+
+	if (g_video_file_bytes >= VIDEO_FILE_SIZE_LIMIT) {
+		fclose(g_video_file);
+		g_video_file = NULL;
+		LOGI("video file closed at %zu bytes, starting next\n",
+		     g_video_file_bytes);
+	}
+}
+
+static void video_file_close(void)
+{
+	if (g_video_file) {
+		fclose(g_video_file);
+		g_video_file = NULL;
+		LOGI("video file closed (%zu bytes)\n", g_video_file_bytes);
+	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -785,6 +849,7 @@ int main(int argc, char *argv[])
 		     (unsigned long long)frame_count);
 
 		release_pending_frame();
+		video_file_close();
 		uart1_deinit(uart_fd);
 	}
 
