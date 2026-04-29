@@ -55,6 +55,13 @@ static imu_parser_t           *g_imu_parser = NULL;
 static uint8_t g_imu_buf[IMU_BUF_SIZE][IMU_PKT_WIRE_SIZE];
 static int     g_imu_count = 0;
 
+/* Base timestamp subtracted before casting system_time to float32.
+ * Set on the first received IMU packet. Keeps the wire value small so
+ * float32 precision stays in the microsecond range regardless of how
+ * large the absolute system_time has grown. */
+static double  g_system_time_base  = 0.0;
+static int     g_system_time_set   = 0;
+
 typedef struct {
 	int      valid;
 	CVI_U64  pts;
@@ -97,6 +104,11 @@ static void on_imu_packet(const imu_packet_t *t_pkt, void *t_user)
 
 	if (!t_pkt || imu_decode_tilt(t_pkt, &tilt) != 0)
 		return;
+
+	if (!g_system_time_set) {
+		g_system_time_base = tilt.system_time;
+		g_system_time_set  = 1;
+	}
 
 	if (g_imu_count >= IMU_BUF_SIZE)
 		g_imu_count = 0;
@@ -196,9 +208,15 @@ static const uint8_t k_sei_uuid[16] = {
 
 static void build_timu_pkt(uint8_t out[IMU_PKT_WIRE_SIZE], const imu_tilt_t *tilt)
 {
-	/* TImuData: float ts, x0, y0, z0, x1, y1, z1 — 7 x 4 = 28 bytes */
+	/* TImuData: float ts, x0, y0, z0, x1, y1, z1 — 7 x 4 = 28 bytes
+	 *
+	 * ts is stored as (system_time - base) so the value stays small and
+	 * float32 precision remains in the microsecond range. At ~100s relative
+	 * time the float32 ULP is ~12 μs; at the raw absolute value (~20000 s)
+	 * it would be ~1.9 ms, causing the periodic jump you would otherwise see
+	 * every ~14 frames. */
 	float v[7];
-	v[0] = (float)tilt->system_time;
+	v[0] = (float)(tilt->system_time - g_system_time_base);
 	v[1] = tilt->gyro[0];
 	v[2] = tilt->gyro[1];
 	v[3] = tilt->gyro[2];
