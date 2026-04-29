@@ -37,17 +37,43 @@ static SAMPLE_INI_CFG_S        g_stIniCfg;
 static imu_parser_t           *g_imu_parser = NULL;
 
 /* ------------------------------------------------------------------ */
-/* IMU batch buffer                                                    */
-/* Accumulate IMU_BATCH_SIZE packets then send together with one       */
-/* video frame.                                                        */
+/* IMU batch buffer + pending video frame                             */
+/*                                                                    */
+/* IMU packets are accumulated in order. Once IMU_BATCH_SIZE packets  */
+/* have arrived AND a video frame is cached, the batch is emitted as  */
+/* a prefix SEI immediately followed by the video NALs. The batch     */
+/* counter is then reset to zero so the next batch starts fresh.      */
+/*                                                                    */
+/* A single video frame is cached from VENC as soon as it is ready.  */
+/* If another frame arrives while the cached frame is still waiting   */
+/* for its IMU batch, it is drained to prevent encoder stall.         */
 /* ------------------------------------------------------------------ */
-#define IMU_BATCH_SIZE 8
+#define IMU_BATCH_SIZE 8    /* packets packed into one SEI */
+#define IMU_BUF_SIZE   16   /* accumulation limit; reset to 0 when reached */
 #define IMU_PKT_WIRE_SIZE 28
 
-static uint8_t g_imu_buf[IMU_BATCH_SIZE][IMU_PKT_WIRE_SIZE];
-static int      g_imu_count = 0;
+static uint8_t g_imu_buf[IMU_BUF_SIZE][IMU_PKT_WIRE_SIZE];
+static int     g_imu_count = 0;
+
+typedef struct {
+	int      valid;
+	CVI_U64  pts;
+	uint8_t *data;     /* flat copy of all pack payloads */
+	size_t   data_len;
+	struct {
+		size_t offset;
+		size_t length;
+	} packs[64];       /* max packs per frame; 64 is generous */
+	CVI_U32  pack_count;
+} pending_frame_t;
+
+static pending_frame_t g_pending_frame;
 
 static void build_timu_pkt(uint8_t out[IMU_PKT_WIRE_SIZE], const imu_tilt_t *tilt);
+static int  capture_pending_frame(VENC_CHN t_chn);
+static void release_pending_frame(void);
+static void drain_venc(VENC_CHN t_chn);
+static int  try_send_pending_frame(void);
 
 
 static void sig_handle(int signo)
@@ -61,7 +87,8 @@ static void sig_handle(int signo)
 
 /* Accumulate decoded IMU packets into g_imu_buf.
  * Called from imu_parser_feed() on every complete, checksummed packet.
- * When the buffer is full (IMU_BATCH_SIZE) the main loop sends a frame. */
+ * Drops the packet silently if the batch is already full (the main loop
+ * has not consumed it yet). */
 static void on_imu_packet(const imu_packet_t *t_pkt, void *t_user)
 {
 	imu_tilt_t tilt;
@@ -71,8 +98,8 @@ static void on_imu_packet(const imu_packet_t *t_pkt, void *t_user)
 	if (!t_pkt || imu_decode_tilt(t_pkt, &tilt) != 0)
 		return;
 
-	if (g_imu_count >= IMU_BATCH_SIZE)
-		return; /* batch not consumed yet; drop oldest-overrun */
+	if (g_imu_count >= IMU_BUF_SIZE)
+		g_imu_count = 0;
 
 	build_timu_pkt(g_imu_buf[g_imu_count], &tilt);
 	g_imu_count++;
@@ -182,7 +209,8 @@ static void build_timu_pkt(uint8_t out[IMU_PKT_WIRE_SIZE], const imu_tilt_t *til
 }
 
 /* Build one H.265 prefix SEI NAL (user_data_unregistered) with 8 TImuPkt blobs. */
-static size_t build_h265_prefix_sei(uint8_t *dst, size_t dst_size)
+static size_t build_h265_prefix_sei(uint8_t *dst, size_t dst_size,
+	const uint8_t t_imu_buf[IMU_BATCH_SIZE][IMU_PKT_WIRE_SIZE])
 {
 	uint8_t sei_rbsp[1 + 4 + 16 + 1 + (IMU_BATCH_SIZE * IMU_PKT_WIRE_SIZE) + 1];
 	size_t rbsp_len = 0;
@@ -192,7 +220,7 @@ static size_t build_h265_prefix_sei(uint8_t *dst, size_t dst_size)
 	int payload_size = 16 + 1 + (IMU_BATCH_SIZE * IMU_PKT_WIRE_SIZE);
 	int remain = payload_size;
 
-	if (!dst)
+	if (!dst || !t_imu_buf)
 		return 0;
 
 	/* SEI payload_type=5 (user_data_unregistered). */
@@ -206,7 +234,7 @@ static size_t build_h265_prefix_sei(uint8_t *dst, size_t dst_size)
 	memcpy(&sei_rbsp[rbsp_len], k_sei_uuid, sizeof(k_sei_uuid));
 	rbsp_len += sizeof(k_sei_uuid);
 	sei_rbsp[rbsp_len++] = 2; /* userdata0: payload version/type */
-	memcpy(&sei_rbsp[rbsp_len], &g_imu_buf[0][0], IMU_BATCH_SIZE * IMU_PKT_WIRE_SIZE);
+	memcpy(&sei_rbsp[rbsp_len], &t_imu_buf[0][0], IMU_BATCH_SIZE * IMU_PKT_WIRE_SIZE);
 	rbsp_len += IMU_BATCH_SIZE * IMU_PKT_WIRE_SIZE;
 	sei_rbsp[rbsp_len++] = 0x80; /* rbsp_trailing_bits */
 
@@ -245,77 +273,89 @@ static size_t build_h265_prefix_sei(uint8_t *dst, size_t dst_size)
 	return out;
 }
 
-/*
- * Get one encoded frame from VENC, send TH264SEI + all video NALs, reset
- * the IMU batch counter.  Call only when g_imu_count == IMU_BATCH_SIZE.
- *
- * If the encoder has no frame ready the IMU batch is discarded and a
- * warning is logged so the pipeline does not stall.
- */
-/*
- * Try to send one video frame together with the accumulated IMU batch.
- *
- * Called only when g_imu_count == IMU_BATCH_SIZE AND venc_fd is readable.
- * If the encoder has no frame ready yet (should be rare since venc_fd fired),
- * the IMU batch is kept intact so the next call can retry.
- * The batch is reset only after a successful send.
- */
-static void send_batch(VENC_CHN chn)
+/* Capture one VENC frame into g_pending_frame (heap copy).
+ * The encoder stream is released immediately after the copy so the
+ * encoder buffer is never held across loop iterations.
+ * Returns 0 on success, -1 if no frame was available or on error. */
+static int capture_pending_frame(VENC_CHN t_chn)
 {
 	VENC_CHN_STATUS_S stStat   = {};
 	VENC_STREAM_S     stStream = {};
+	size_t            total    = 0;
+	size_t            offset   = 0;
 	CVI_U32           i;
-	uint8_t           sei_nal[1024];
-	size_t            sei_len;
 
-	if (CVI_VENC_QueryStatus(chn, &stStat) != CVI_SUCCESS ||
-	    stStat.u32CurPacks == 0) {
-		LOGD_RL(1000000ULL, "send_batch: venc not ready, holding IMU batch\n");
-		return; /* keep g_imu_count intact, retry next time venc_fd fires */
-	}
+	if (g_pending_frame.valid)
+		return 0;
+
+	if (CVI_VENC_QueryStatus(t_chn, &stStat) != CVI_SUCCESS ||
+	    stStat.u32CurPacks == 0)
+		return -1;
 
 	stStream.pstPack = (VENC_PACK_S *)malloc(
 	    sizeof(VENC_PACK_S) * stStat.u32CurPacks);
 	if (!stStream.pstPack)
-		return;
+		return -1;
 
-	if (CVI_VENC_GetStream(chn, &stStream, 1000) != CVI_SUCCESS) {
+	if (CVI_VENC_GetStream(t_chn, &stStream, 0) != CVI_SUCCESS) {
 		free(stStream.pstPack);
-		return;
+		return -1;
 	}
 
-	/* Frame acquired — now build SEI and send. */
-	sei_len = build_h265_prefix_sei(sei_nal, sizeof(sei_nal));
-	if (sei_len == 0) {
-		CVI_VENC_ReleaseStream(chn, &stStream);
-		free(stStream.pstPack);
-		LOGW("build_h265_prefix_sei failed, dropping this batch\n");
-		g_imu_count = 0;
-		return;
+	if (stStream.u32PackCount > 64) {
+		LOGW("pack_count %u > 64, clamping\n", stStream.u32PackCount);
+		stStream.u32PackCount = 64;
 	}
-	g_imu_count = 0;
 
-	/* SEI first, then video NALs. */
-	rtsp_send_h265_data(sei_nal, sei_len);
+	for (i = 0; i < stStream.u32PackCount; i++) {
+		VENC_PACK_S *p = &stStream.pstPack[i];
+		size_t len = (p->u32Len > p->u32Offset)
+		             ? (size_t)(p->u32Len - p->u32Offset) : 0;
+		g_pending_frame.packs[i].offset = total;
+		g_pending_frame.packs[i].length = len;
+		total += len;
+	}
+
+	g_pending_frame.data = (uint8_t *)malloc(total);
+	if (!g_pending_frame.data) {
+		CVI_VENC_ReleaseStream(t_chn, &stStream);
+		free(stStream.pstPack);
+		return -1;
+	}
 
 	for (i = 0; i < stStream.u32PackCount; i++) {
 		VENC_PACK_S *p   = &stStream.pstPack[i];
-		int          len = (int)(p->u32Len - p->u32Offset);
-		if (len > 0)
-			rtsp_send_h265_data(p->pu8Addr + p->u32Offset, (size_t)len);
+		size_t       len = g_pending_frame.packs[i].length;
+		if (len > 0) {
+			memcpy(g_pending_frame.data + offset,
+			       p->pu8Addr + p->u32Offset, len);
+			offset += len;
+		}
 	}
 
-	CVI_VENC_ReleaseStream(chn, &stStream);
+	g_pending_frame.valid      = 1;
+	g_pending_frame.pts        = stStream.pstPack[0].u64PTS;
+	g_pending_frame.pack_count = stStream.u32PackCount;
+	g_pending_frame.data_len   = total;
+
+	CVI_VENC_ReleaseStream(t_chn, &stStream);
 	free(stStream.pstPack);
+	return 0;
 }
 
-/* Drain one pending VENC frame without sending (prevents encoder stall). */
-static void drain_venc(VENC_CHN chn)
+static void release_pending_frame(void)
+{
+	free(g_pending_frame.data);
+	memset(&g_pending_frame, 0, sizeof(g_pending_frame));
+}
+
+/* Drain one VENC frame without sending to prevent encoder stall. */
+static void drain_venc(VENC_CHN t_chn)
 {
 	VENC_CHN_STATUS_S stStat   = {};
 	VENC_STREAM_S     stStream = {};
 
-	if (CVI_VENC_QueryStatus(chn, &stStat) != CVI_SUCCESS ||
+	if (CVI_VENC_QueryStatus(t_chn, &stStat) != CVI_SUCCESS ||
 	    stStat.u32CurPacks == 0)
 		return;
 
@@ -324,10 +364,50 @@ static void drain_venc(VENC_CHN chn)
 	if (!stStream.pstPack)
 		return;
 
-	if (CVI_VENC_GetStream(chn, &stStream, 0) == CVI_SUCCESS)
-		CVI_VENC_ReleaseStream(chn, &stStream);
+	if (CVI_VENC_GetStream(t_chn, &stStream, 0) == CVI_SUCCESS)
+		CVI_VENC_ReleaseStream(t_chn, &stStream);
 
 	free(stStream.pstPack);
+}
+
+/* Send the cached frame with a SEI prefix built from the current IMU batch.
+ * Called only when both conditions are met: IMU batch is full AND a frame
+ * is cached. Resets the IMU counter and releases the frame on success.
+ * Returns 1 if sent, 0 if conditions not met. */
+static int try_send_pending_frame(void)
+{
+	uint8_t sei_nal[1024];
+	size_t  sei_len;
+	CVI_U32 i;
+
+	if (!g_pending_frame.valid || g_imu_count < IMU_BATCH_SIZE)
+		return 0;
+
+	sei_len = build_h265_prefix_sei(sei_nal, sizeof(sei_nal), g_imu_buf);
+	if (sei_len == 0) {
+		LOGW("build_h265_prefix_sei failed, dropping pending frame\n");
+		release_pending_frame();
+		g_imu_count = 0;
+		return 0;
+	}
+
+	g_imu_count = 0;
+
+	rtsp_send_h265_data(sei_nal, sei_len);
+
+	for (i = 0; i < g_pending_frame.pack_count; i++) {
+		size_t len = g_pending_frame.packs[i].length;
+		if (len > 0)
+			rtsp_send_h265_data(
+			    g_pending_frame.data + g_pending_frame.packs[i].offset,
+			    len);
+	}
+
+	LOGT("sent frame pts=%llu with %d imu pkts\n",
+	     (unsigned long long)g_pending_frame.pts, IMU_BATCH_SIZE);
+
+	release_pending_frame();
+	return 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -635,10 +715,13 @@ int main(int argc, char *argv[])
 
 		/*
 		 * Main loop:
-		 *   - IMU drives sending: every IMU_BATCH_SIZE packets → send_batch()
-		 *   - venc_fd is monitored only to drain encoder output when the IMU
-		 *     batch is not yet full; this prevents the encoder ring buffer from
-		 *     stalling under sustained load.
+		 *   - When venc_fd is readable, capture the encoded frame into a
+		 *     heap buffer (if no frame is cached yet) or drain it (if one
+		 *     is already waiting) to prevent the encoder ring from stalling.
+		 *   - IMU packets are accumulated in g_imu_buf as they arrive.
+		 *   - After each select(), try_send_pending_frame() checks whether
+		 *     both the cached frame and a full IMU batch are ready; if so,
+		 *     it sends SEI + video NALs and resets for the next pair.
 		 */
 		while (!g_exit_flag) {
 			struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 }; /* 50 ms */
@@ -661,31 +744,29 @@ int main(int argc, char *argv[])
 				break;
 			}
 
-			/* Process incoming IMU bytes first. */
 			if (uart_fd >= 0 && FD_ISSET(uart_fd, &read_fds))
 				uart1_handle_rx_tx(uart_fd);
 
 			if (FD_ISSET(venc_fd, &read_fds)) {
-				if (g_imu_count >= IMU_BATCH_SIZE) {
-					/* IMU batch full and encoder has a frame: send together. */
-					send_batch(VencChn);
-					if (g_imu_count == 0) { /* send succeeded */
-						frame_count++;
-						if (frame_count == 1)
-							LOGI("first batch sent\n");
-						LOGI_RL(5000000ULL, "sent %llu batches\n",
-						        (unsigned long long)frame_count);
-					}
-				} else {
-					/* Batch not full yet: drain encoder to prevent stall. */
+				if (!g_pending_frame.valid)
+					capture_pending_frame(VencChn);
+				else
 					drain_venc(VencChn);
-				}
+			}
+
+			if (try_send_pending_frame()) {
+				frame_count++;
+				if (frame_count == 1)
+					LOGI("first frame sent\n");
+				LOGI_RL(5000000ULL, "sent %llu frames\n",
+				        (unsigned long long)frame_count);
 			}
 		}
 
 		LOGI("shutting down after %llu frames\n",
 		     (unsigned long long)frame_count);
 
+		release_pending_frame();
 		uart1_deinit(uart_fd);
 	}
 
