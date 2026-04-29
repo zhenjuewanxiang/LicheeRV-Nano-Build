@@ -20,12 +20,15 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <termios.h>
+#include <pthread.h>
+#include <sys/stat.h>
 
 #define LOG_MODULE "MUX"
 #include "imu.h"
 #include "log.h"
 #include "sample_comm.h"
 #include "rtsp-server.h"
+#include "cvi_audio.h"
 
 /* ------------------------------------------------------------------ */
 /* Global state                                                        */
@@ -449,6 +452,7 @@ static void video_file_open_next(void)
 {
 	char path[128];
 
+	mkdir(VIDEO_FILE_DIR, 0755);
 	snprintf(path, sizeof(path), "%s/video_%04d.h265",
 	         VIDEO_FILE_DIR, g_video_file_idx++);
 	g_video_file = fopen(path, "wb");
@@ -490,6 +494,176 @@ static void video_file_close(void)
 		g_video_file = NULL;
 		LOGI("video file closed (%zu bytes)\n", g_video_file_bytes);
 	}
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Audio recording (AI -> AENC G711A, saved alongside video files)    */
+/* ------------------------------------------------------------------ */
+#define AUDIO_SAMPLE_RATE  8000   /* Hz */
+#define AUDIO_PT_NUM       320    /* samples per frame = 40 ms at 8 kHz */
+
+static FILE           *g_audio_file  = NULL;
+static pthread_t       g_audio_thread;
+static volatile int    g_audio_stop  = 0;
+
+static void audio_file_open(int idx)
+{
+	char path[128];
+
+	snprintf(path, sizeof(path), "%s/audio_%04d.g711a",
+	         VIDEO_FILE_DIR, idx);
+	g_audio_file = fopen(path, "wb");
+	if (!g_audio_file)
+		LOGW("cannot open audio file %s: %s\n", path, strerror(errno));
+	else
+		LOGI("audio recording to %s\n", path);
+}
+
+static void audio_file_close(void)
+{
+	if (g_audio_file) {
+		fclose(g_audio_file);
+		g_audio_file = NULL;
+	}
+}
+
+/* Audio capture thread: drains AENC stream and writes to file.
+ * File rotation is tied to video file rotation: when g_video_file_idx
+ * increments (a new video_NNNN.h265 was opened), a matching
+ * audio_NNNN.g711a is opened. */
+static void *audio_capture_thread(void *arg)
+{
+	int last_video_idx = 0;
+
+	(void)arg;
+
+	while (!g_audio_stop) {
+		int cur = g_video_file_idx;
+
+		if (cur != last_video_idx && cur > 0) {
+			audio_file_close();
+			audio_file_open(cur - 1);
+			last_video_idx = cur;
+		}
+
+		AUDIO_STREAM_S stStream = {};
+		CVI_S32 ret = CVI_AENC_GetStream(0, &stStream, 40);
+		if (ret == CVI_SUCCESS) {
+			if (g_audio_file && stStream.pStream && stStream.u32Len > 0)
+				fwrite(stStream.pStream, 1,
+				       (size_t)stStream.u32Len, g_audio_file);
+			CVI_AENC_ReleaseStream(0, &stStream);
+		}
+	}
+
+	audio_file_close();
+	return NULL;
+}
+
+static int sys_audio_init(void)
+{
+	AIO_ATTR_S       stAiAttr   = {};
+	AENC_ATTR_G711_S stG711Attr = { .resv = 0 };
+	AENC_CHN_ATTR_S  stAencAttr = {};
+	MMF_CHN_S        stSrc, stDst;
+	CVI_S32          s32Ret;
+
+	stAiAttr.enSamplerate   = AUDIO_SAMPLE_RATE_8000;
+	stAiAttr.u32ChnCnt      = 2;   /* inner codec requires 2 channels */
+	stAiAttr.enSoundmode    = AUDIO_SOUND_MODE_MONO;
+	stAiAttr.enBitwidth     = AUDIO_BIT_WIDTH_16;
+	stAiAttr.enWorkmode     = AIO_MODE_I2S_MASTER;
+	stAiAttr.u32EXFlag      = 0;
+	stAiAttr.u32FrmNum      = 10;
+	stAiAttr.u32PtNumPerFrm = AUDIO_PT_NUM;
+	stAiAttr.u32ClkSel      = 0;
+	stAiAttr.enI2sType      = AIO_I2STYPE_INNERCODEC;
+
+	s32Ret = CVI_AUDIO_INIT();
+	if (s32Ret != CVI_SUCCESS) {
+		LOGE("CVI_AUDIO_INIT failed 0x%x\n", s32Ret);
+		return -1;
+	}
+
+	s32Ret = CVI_AI_SetPubAttr(0, &stAiAttr);
+	if (s32Ret != CVI_SUCCESS) {
+		LOGE("CVI_AI_SetPubAttr failed 0x%x\n", s32Ret);
+		goto err_deinit;
+	}
+
+	s32Ret = CVI_AI_Enable(0);
+	if (s32Ret != CVI_SUCCESS) {
+		LOGE("CVI_AI_Enable failed 0x%x\n", s32Ret);
+		goto err_deinit;
+	}
+
+	s32Ret = CVI_AI_EnableChn(0, 0);
+	if (s32Ret != CVI_SUCCESS) {
+		LOGE("CVI_AI_EnableChn failed 0x%x\n", s32Ret);
+		goto err_disable_dev;
+	}
+
+	stAencAttr.enType         = PT_G711A;
+	stAencAttr.u32PtNumPerFrm = AUDIO_PT_NUM;
+	stAencAttr.u32BufSize     = 30;
+	stAencAttr.pValue         = &stG711Attr;
+	stAencAttr.bFileDbgMode   = CVI_FALSE;
+
+	s32Ret = CVI_AENC_CreateChn(0, &stAencAttr);
+	if (s32Ret != CVI_SUCCESS) {
+		LOGE("CVI_AENC_CreateChn failed 0x%x\n", s32Ret);
+		goto err_disable_chn;
+	}
+
+	stSrc.enModId  = CVI_ID_AI;
+	stSrc.s32DevId = 0;
+	stSrc.s32ChnId = 0;
+	stDst.enModId  = CVI_ID_AENC;
+	stDst.s32DevId = 0;
+	stDst.s32ChnId = 0;
+	CVI_AUD_SYS_Bind(&stSrc, &stDst);
+
+	g_audio_stop = 0;
+	if (pthread_create(&g_audio_thread, NULL, audio_capture_thread, NULL) != 0) {
+		LOGE("audio thread create failed\n");
+		CVI_AUD_SYS_UnBind(&stSrc, &stDst);
+		goto err_aenc;
+	}
+
+	LOGI("audio init OK (G711A %d Hz mono)\n", AUDIO_SAMPLE_RATE);
+	return 0;
+
+err_aenc:
+	CVI_AENC_DestroyChn(0);
+err_disable_chn:
+	CVI_AI_DisableChn(0, 0);
+err_disable_dev:
+	CVI_AI_Disable(0);
+err_deinit:
+	CVI_AUDIO_DEINIT();
+	return -1;
+}
+
+static void sys_audio_deinit(void)
+{
+	MMF_CHN_S stSrc, stDst;
+
+	g_audio_stop = 1;
+	pthread_join(g_audio_thread, NULL);
+
+	stSrc.enModId  = CVI_ID_AI;
+	stSrc.s32DevId = 0;
+	stSrc.s32ChnId = 0;
+	stDst.enModId  = CVI_ID_AENC;
+	stDst.s32DevId = 0;
+	stDst.s32ChnId = 0;
+	CVI_AUD_SYS_UnBind(&stSrc, &stDst);
+
+	CVI_AENC_DestroyChn(0);
+	CVI_AI_DisableChn(0, 0);
+	CVI_AI_Disable(0);
+	CVI_AUDIO_DEINIT();
 }
 
 /* ------------------------------------------------------------------ */
@@ -775,7 +949,11 @@ int main(int argc, char *argv[])
 		goto err_vi;
 	}
 
-	/* 4. Encode → stream loop */
+	/* 4. Init audio (non-fatal: continue without audio if unavailable) */
+	if (sys_audio_init() != 0)
+		LOGW("audio init failed, recording without audio\n");
+
+	/* 5. Encode → stream loop */
 	{
 		VENC_CHN       VencChn  = 0;
 		CVI_S32        venc_fd  = CVI_VENC_GetFd(VencChn);
@@ -853,6 +1031,7 @@ int main(int argc, char *argv[])
 		uart1_deinit(uart_fd);
 	}
 
+	sys_audio_deinit();
 err_venc:
 	sys_venc_deinit();
 err_vi:
