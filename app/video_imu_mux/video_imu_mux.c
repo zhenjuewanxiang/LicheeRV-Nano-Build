@@ -21,6 +21,7 @@
 #include <errno.h>
 #include <termios.h>
 #include <sys/mman.h>
+#include <pthread.h>
 
 #define LOG_MODULE "MUX"
 #include "imu.h"
@@ -120,7 +121,7 @@ static void sys_venc_mjpeg_deinit(void);
 static int  uvc_shm_init(void);
 static void uvc_shm_write_mjpeg(const uint8_t *t_jpeg, uint32_t t_len);
 static void uvc_shm_deinit(void);
-static void send_mjpeg_to_uvc(void);
+static void *mjpeg_thread_fn(void *arg);
 
 
 static void sig_handle(int signo)
@@ -545,66 +546,81 @@ static void uvc_shm_deinit(void)
 	}
 }
 
-/* Pull one MJPEG frame from VENC ch UVC_MJPEG_CHN and push it to the
- * UVC shared memory.  Uses a function-local static buffer to avoid a
- * heap allocation on every frame. */
-static void send_mjpeg_to_uvc(void)
+/* Dedicated thread: pulls MJPEG frames from VENC and writes to UVC shm.
+ * Runs at the VENC output rate (~30 fps) completely independently of the
+ * H.265 / RTSP main loop, so UVC frame delivery is never stalled by IMU
+ * batching or H.265 select() waits. */
+static void *mjpeg_thread_fn(void *arg)
 {
-	VENC_CHN_STATUS_S  stStat   = {};
-	VENC_STREAM_S      stStream = {};
-	static uint8_t     jpeg_buf[UVC_MAX_JPEG_SIZE];
-	size_t             total = 0;
-	CVI_U32            i;
+	(void)arg;
+	static uint8_t  jpeg_buf[UVC_MAX_JPEG_SIZE];
 
-	if (!g_uvc_shm)
-		return;
+	while (!g_exit_flag) {
+		VENC_CHN_STATUS_S stStat   = {};
+		VENC_STREAM_S     stStream = {};
+		size_t            total    = 0;
+		CVI_U32           i;
+		static uint64_t   cnt      = 0;
 
-	/* QueryStatus to size the pack array; log diagnostic at low rate */
-	if (CVI_VENC_QueryStatus(UVC_MJPEG_CHN, &stStat) != CVI_SUCCESS) {
-		LOGD_RL(2000000ULL, "uvc: QueryStatus failed\n");
-		return;
-	}
-	LOGD_RL(5000000ULL, "uvc: QueryStatus packs=%u\n", stStat.u32CurPacks);
-	if (stStat.u32CurPacks == 0)
-		return;
-
-	stStream.pstPack = (VENC_PACK_S *)malloc(
-	    sizeof(VENC_PACK_S) * stStat.u32CurPacks);
-	if (!stStream.pstPack)
-		return;
-
-	/* Non-blocking: QueryStatus already confirmed a frame is ready */
-	if (CVI_VENC_GetStream(UVC_MJPEG_CHN, &stStream, 0) != CVI_SUCCESS) {
-		LOGD_RL(2000000ULL, "uvc: GetStream failed\n");
-		free(stStream.pstPack);
-		return;
-	}
-
-	for (i = 0; i < stStream.u32PackCount; i++) {
-		VENC_PACK_S *p   = &stStream.pstPack[i];
-		size_t       len = (p->u32Len > p->u32Offset)
-		                   ? (size_t)(p->u32Len - p->u32Offset) : 0;
-		if (total + len > UVC_MAX_JPEG_SIZE) {
-			LOGD_RL(1000000ULL, "uvc: JPEG truncated at %zu bytes\n", total);
-			break;
+		if (!g_uvc_shm) {
+			usleep(10000);
+			continue;
 		}
-		memcpy(jpeg_buf + total, p->pu8Addr + p->u32Offset, len);
-		total += len;
-	}
 
-	CVI_VENC_ReleaseStream(UVC_MJPEG_CHN, &stStream);
-	free(stStream.pstPack);
+		/* Block up to 40 ms for the next encoded MJPEG frame.
+		 * This keeps CPU at zero between frames. */
+		if (CVI_VENC_QueryStatus(UVC_MJPEG_CHN, &stStat)
+		    != CVI_SUCCESS) {
+			usleep(5000);
+			continue;
+		}
+		if (stStat.u32CurPacks == 0) {
+			usleep(5000);
+			continue;
+		}
 
-	if (total > 0) {
-		static uint64_t uvc_cnt = 0;
-		if (++uvc_cnt == 1)
-			LOGI("first MJPEG → shm: %zu bytes  SOI=%02x%02x\n",
-			     total, jpeg_buf[0], jpeg_buf[1]);
-		LOGI_RL(5000000ULL, "MJPEG shm: %llu frames, last %u bytes\n",
-		        (unsigned long long)uvc_cnt, (unsigned)total);
-		uvc_shm_write_mjpeg(jpeg_buf, (uint32_t)total);
+		stStream.pstPack = (VENC_PACK_S *)malloc(
+		    sizeof(VENC_PACK_S) * stStat.u32CurPacks);
+		if (!stStream.pstPack) {
+			usleep(5000);
+			continue;
+		}
+
+		if (CVI_VENC_GetStream(UVC_MJPEG_CHN, &stStream, 40)
+		    != CVI_SUCCESS) {
+			free(stStream.pstPack);
+			usleep(5000);
+			continue;
+		}
+
+		for (i = 0; i < stStream.u32PackCount; i++) {
+			VENC_PACK_S *p   = &stStream.pstPack[i];
+			size_t       len = (p->u32Len > p->u32Offset)
+			                   ? (size_t)(p->u32Len -
+			                   p->u32Offset) : 0;
+			if (total + len > UVC_MAX_JPEG_SIZE) break;
+			memcpy(jpeg_buf + total,
+			       p->pu8Addr + p->u32Offset, len);
+			total += len;
+		}
+
+		CVI_VENC_ReleaseStream(UVC_MJPEG_CHN, &stStream);
+		free(stStream.pstPack);
+
+		if (total > 0) {
+			if (++cnt == 1)
+				LOGI("MJPEG thread: first frame %zu bytes "
+				     "SOI=%02x%02x\n",
+				     total, jpeg_buf[0], jpeg_buf[1]);
+			LOGI_RL(5000000ULL,
+			        "MJPEG thread: %llu frames, last %u B\n",
+			        (unsigned long long)cnt, (unsigned)total);
+			uvc_shm_write_mjpeg(jpeg_buf, (uint32_t)total);
+		}
 	}
+	return NULL;
 }
+
 
 /* ------------------------------------------------------------------ */
 /* VI + VPSS initialisation                                            */
@@ -1051,10 +1067,11 @@ int main(int argc, char *argv[])
 
 		/* 5. Encode → stream loop */
 		{
-			VENC_CHN VencChn  = 0;
-			CVI_S32  venc_fd  = CVI_VENC_GetFd(VencChn);
-			CVI_S32  mjpeg_fd = uvc_ok
-			                    ? CVI_VENC_GetFd(UVC_MJPEG_CHN) : -1;
+			VENC_CHN VencChn   = 0;
+			CVI_S32  venc_fd   = CVI_VENC_GetFd(VencChn);
+			CVI_S32  mjpeg_fd  = uvc_ok
+			                     ? CVI_VENC_GetFd(UVC_MJPEG_CHN) : -1;
+			pthread_t mjpeg_tid = 0;
 			int      uart_fd  = -1;
 			uint64_t frame_count = 0;
 
@@ -1072,6 +1089,18 @@ int main(int argc, char *argv[])
 				LOGI("uart1 ready: /dev/ttyS1 460800 8N1 (A18/A19)\n");
 			else
 				LOGW("uart1 init failed, continue without uart\n");
+
+			/* Start dedicated MJPEG→UVC thread */
+			if (uvc_ok) {
+				if (pthread_create(&mjpeg_tid, NULL,
+				    mjpeg_thread_fn, NULL) != 0) {
+					LOGW("MJPEG thread create failed"
+					     " — UVC may be choppy\n");
+					mjpeg_tid = 0;
+				} else {
+					LOGI("MJPEG thread started\n");
+				}
+			}
 
 			LOGI("entering encode/stream loop (h265_fd=%d mjpeg_fd=%d)\n",
 			     venc_fd, mjpeg_fd);
@@ -1120,21 +1149,7 @@ int main(int argc, char *argv[])
 						drain_venc(VencChn);
 				}
 
-				/* Rate-limited MJPEG poll at ~30 fps, not triggered
-			 * by fd (some SDK builds don't wake select() for
-			 * MJPEG channels). */
-				if (uvc_ok) {
-					static uint64_t next_mjpeg_us = 0;
-					struct timeval  tv_now;
-					uint64_t        now_us;
-					gettimeofday(&tv_now, NULL);
-					now_us = (uint64_t)tv_now.tv_sec
-					         * 1000000ULL + tv_now.tv_usec;
-					if (now_us >= next_mjpeg_us) {
-						send_mjpeg_to_uvc();
-						next_mjpeg_us = now_us + 33333;
-					}
-				}
+				/* MJPEG→UVC is handled by mjpeg_thread_fn */
 
 				if (try_send_pending_frame()) {
 					frame_count++;
@@ -1147,6 +1162,12 @@ int main(int argc, char *argv[])
 
 			LOGI("shutting down after %llu frames\n",
 			     (unsigned long long)frame_count);
+
+			/* Stop MJPEG thread (g_exit_flag already set) */
+			if (mjpeg_tid) {
+				pthread_join(mjpeg_tid, NULL);
+				mjpeg_tid = 0;
+			}
 
 			release_pending_frame();
 			if (uvc_ok) {
