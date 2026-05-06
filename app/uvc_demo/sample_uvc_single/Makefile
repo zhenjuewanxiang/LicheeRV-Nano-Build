@@ -1,13 +1,18 @@
 SHELL = /bin/bash
 ifeq ($(PARAM_FILE), )
-	PARAM_FILE:=../../Makefile.param
+	PARAM_FILE:=../../../middleware/v2/Makefile.param
 	include $(PARAM_FILE)
 endif
-include ../sample.mk
+
+MW_SAMPLE := $(realpath $(CURDIR)/../../../middleware/v2/sample)
+COMMON_DIR := $(MW_SAMPLE)/common
+PANEL_INC := $(MW_PATH)/component/panel/$(shell echo $(CHIP_ARCH) | tr A-Z a-z)
+
+include $(MW_SAMPLE)/sample.mk
 
 SDIR = $(PWD)/src
-SRCS = $(wildcard $(SDIR)/*.c) $(wildcard $(SDIR)/src/*.c)
-SRCS += $(COMMON_DIR)/sample_common_venc.c	\
+LOCAL_SRCS = $(wildcard $(SDIR)/*.c) $(wildcard $(SDIR)/src/*.c)
+COMMON_SRCS = $(COMMON_DIR)/sample_common_venc.c	\
 		$(COMMON_DIR)/sample_common_vdec.c	\
 		$(COMMON_DIR)/sample_common_vo.c	\
 		$(COMMON_DIR)/md5sum.c	\
@@ -18,9 +23,14 @@ SRCS += $(COMMON_DIR)/sample_common_venc.c	\
 		$(COMMON_DIR)/sample_common_vi.c	\
 		$(COMMON_DIR)/sample_common_isp.c	\
 		$(COMMON_DIR)/sample_common_vpss.c
-INCS = -I$(MW_INC) -I$(ISP_INC) -I../common/ -I$(KERNEL_INC) -I./include -I$(SENSOR_LIST_INC)
+SRCS = $(LOCAL_SRCS) $(COMMON_SRCS)
+INCS = -I$(MW_INC) -I$(ISP_INC) -I$(COMMON_DIR) -I$(KERNEL_INC) -I./include
+INCS += -I$(PANEL_INC)
+INCS += $(if $(SENSOR_LIST_INC),-I$(SENSOR_LIST_INC))
+# GC4653 sensor object must be compiled in for SAMPLE_COMM_SNS_GetSnsObj to work
+CFLAGS += -DSENSOR_GCORE_GC4653
 OBJS = $(SRCS:.c=.o)
-DEPS = $(SRCS:.c=.d)
+DEPS = $(LOCAL_SRCS:.c=.d)
 
 TARGET = sample_uvc_single
 
@@ -43,7 +53,7 @@ EXTRA_LDFLAGS = $(LIBS) -lpthread -lm -lini
 all: $(TARGET)
 
 $(COMMON_DIR)/%.o: $(COMMON_DIR)/%.c
-	@$(CC) $(DEPFLAGS) $(CFLAGS) $(EXTRA_CFLAGS) -o $@ -c $<
+	@$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -o $@ -c $<
 	@echo [$(notdir $(CC))] $(notdir $@)
 
 $(SDIR)/%.o: $(SDIR)/%.c

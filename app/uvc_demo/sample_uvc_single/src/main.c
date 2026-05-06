@@ -4,6 +4,8 @@
 #include <unistd.h>
 #include <semaphore.h>
 #include <errno.h>
+#include <glob.h>
+#include <string.h>
 
 #include "cvi_uvc.h"
 #include "cvi_uvc_gadget.h"
@@ -13,6 +15,37 @@
 
 static sem_t s_ExitSem;/** EXIT semaphore */
 static SAMPLE_VI_CONFIG_S stViConfig;
+
+static int find_uvc_video_node(char *out, size_t out_len)
+{
+	glob_t g;
+	int i;
+	const char *base;
+
+	if (out == NULL || out_len == 0)
+		return -1;
+
+	/* Prefer the node exported by the active UDC gadget path. */
+	if (glob("/sys/class/udc/*/device/gadget/video4linux/video*", 0, NULL, &g) == 0 && g.gl_pathc > 0) {
+		base = strrchr(g.gl_pathv[0], '/');
+		if (base != NULL && *(base + 1) != '\0') {
+			snprintf(out, out_len, "/dev/%s", base + 1);
+			globfree(&g);
+			return 0;
+		}
+		globfree(&g);
+	}
+
+	/* Fallback scan in case sysfs path is unavailable. */
+	for (i = 0; i < 10; i++) {
+		snprintf(out, out_len, "/dev/video%d", i);
+		if (access(out, F_OK) == 0)
+			return 0;
+	}
+
+	out[0] = '\0';
+	return -1;
+}
 
 void sig_handler(int signo)
 {
@@ -30,20 +63,7 @@ void sig_handler(int signo)
 static int32_t _CVI_Init_Vi(SIZE_S *pstSize)
 {
 	MMF_VERSION_S stVersion;
-	SAMPLE_INI_CFG_S	   stIniCfg = {
-		.enSource  = VI_PIPE_FRAME_SOURCE_DEV,
-		.devNum    = 1,
-		.enSnsType[0] = SONY_IMX327_MIPI_2M_30FPS_12BIT,
-		.enWDRMode[0] = WDR_MODE_NONE,
-		.s32BusId[0]  = 3,
-		.s32SnsI2cAddr[0] = -1,
-		.MipiDev[0]   = 0xFF,
-		.enSnsType[1] = SONY_IMX327_SLAVE_MIPI_2M_30FPS_12BIT,
-		.s32BusId[1]  = 3,
-		.s32SnsI2cAddr[1] = -1,
-		.MipiDev[1]   = 0xFF,
-		.u8UseMultiSns = 0,
-	};
+	SAMPLE_INI_CFG_S	   stIniCfg = {0};
 
 	PIC_SIZE_E enPicSize;
 	int32_t s32Ret = CVI_SUCCESS;
@@ -69,6 +89,7 @@ static int32_t _CVI_Init_Vi(SIZE_S *pstSize)
 	 * step1:  Config VI
 	 ************************************************/
 	s32Ret = SAMPLE_COMM_VI_IniToViCfg(&stIniCfg, &stViConfig);
+	printf("stage IniToViCfg ret=0x%x\n", s32Ret);
 	if (s32Ret != CVI_SUCCESS)
 		return s32Ret;
 
@@ -76,12 +97,14 @@ static int32_t _CVI_Init_Vi(SIZE_S *pstSize)
 	 * step2:  Get input size
 	 ************************************************/
 	s32Ret = SAMPLE_COMM_VI_GetSizeBySensor(stIniCfg.enSnsType[0], &enPicSize);
+	printf("stage GetSizeBySensor ret=0x%x\n", s32Ret);
 	if (s32Ret != CVI_SUCCESS) {
 		CVI_TRACE_LOG(CVI_DBG_ERR, "SAMPLE_COMM_VI_GetSizeBySensor failed with %#x\n", s32Ret);
 		return s32Ret;
 	}
 
 	s32Ret = SAMPLE_COMM_SYS_GetPicSize(enPicSize, pstSize);
+	printf("stage GetPicSize ret=0x%x\n", s32Ret);
 	if (s32Ret != CVI_SUCCESS) {
 		CVI_TRACE_LOG(CVI_DBG_ERR, "SAMPLE_COMM_SYS_GetPicSize failed with %#x\n", s32Ret);
 		return s32Ret;
@@ -92,74 +115,38 @@ static int32_t _CVI_Init_Vi(SIZE_S *pstSize)
 	/************************************************
 	 * step3:  Init VB pool
 	 ************************************************/
-	VB_CONFIG_S stVbConf;
-	// CVI_U8 i = 0;
-	CVI_U32 u32BlkSize = 0;
-
-	memset(&stVbConf, 0, sizeof(VB_CONFIG_S));
-	stVbConf.u32MaxPoolCnt = 1;
-
-	u32BlkSize = COMMON_GetPicBufferSize(ALIGN(pstSize->u32Width, 64), ALIGN(pstSize->u32Height, 64), SAMPLE_PIXEL_FORMAT,
-		DATA_BITWIDTH_8, COMPRESS_MODE_NONE, DEFAULT_ALIGN);
-	stVbConf.astCommPool[0].u32BlkSize = u32BlkSize;
-	stVbConf.astCommPool[0].u32BlkCnt = 18;
-	stVbConf.astCommPool[0].enRemapMode = VB_REMAP_MODE_CACHED;
-
-	// u32BlkSize = COMMON_GetPicBufferSize(1280, 768, SAMPLE_PIXEL_FORMAT,
-	// 	DATA_BITWIDTH_8, COMPRESS_MODE_NONE, DEFAULT_ALIGN);
-	// stVbConf.astCommPool[1].u32BlkSize = u32BlkSize;
-	// stVbConf.astCommPool[1].u32BlkCnt = 12;
-	// stVbConf.astCommPool[1].enRemapMode = VB_REMAP_MODE_CACHED;
-
-
-	// for (int e = 0, i = 1; e < CUR_ENCODE_NUM; i++, e++) {
-	// 	SIZE_S stSize;
-	// 	CVI_BOOL bRepeated = CVI_FALSE;
-
-	// 	s32Ret = SAMPLE_COMM_SYS_GetPicSize(mySize[e], &stSize);
-	// 	if (s32Ret != CVI_SUCCESS) {
-	// 		CVI_TRACE_LOG(CVI_DBG_ERR, "SAMPLE_COMM_SYS_GetPicSize failed with %#x\n", s32Ret);
-	// 		return s32Ret;
-	// 	}
-	// 	printf("SAMPLE_COMM_SYS_GetPicSize %dx%d\n", stSize.u32Width, stSize.u32Height);
-	// 	u32BlkSize = COMMON_GetPicBufferSize(stSize.u32Width, stSize.u32Height, PIXEL_FORMAT_YUV_PLANAR_420,
-	// 		DATA_BITWIDTH_8, COMPRESS_MODE_NONE, DEFAULT_ALIGN);
-	// 	for (int j = 0; j < i; j++) {
-	// 		if (u32BlkSize == stVbConf.astCommPool[j].u32BlkSize) {
-	// 			stVbConf.astCommPool[j].u32BlkCnt += 2;
-	// 			bRepeated = CVI_TRUE;
-	// 			break;
-	// 		}
-	// 	}
-	// 	if (bRepeated) {
-	// 		i--;
-	// 		continue;
-	// 	}
-	// 	stVbConf.astCommPool[i].u32BlkSize = u32BlkSize;
-	// 	stVbConf.astCommPool[i].u32BlkCnt = 2;
-	// 	stVbConf.astCommPool[i].enRemapMode = VB_REMAP_MODE_CACHED;
-	// 	stVbConf.u32MaxPoolCnt++;
-	// }
-	// for (i = 0; i < stVbConf.u32MaxPoolCnt; i++) {
-	// 	printf("common pool[%d] BlkSize %d * %d\n"
-	// 		, i, stVbConf.astCommPool[i].u32BlkSize, stVbConf.astCommPool[i].u32BlkCnt);
-	// }
-
-	// VI_CROP_INFO_S stCropInfo;
-	// stCropInfo.bEnable = 1;
-	// stCropInfo.enCropCoordinate = VI_CROP_ABS_COOR;
-	// stCropInfo.stCropRect.s32X = (1920 - 1280) / 2; 
-	// stCropInfo.stCropRect.s32Y = (1080 - 720) / 2; 
-	// stCropInfo.stCropRect.u32Width = 1280;
-	// stCropInfo.stCropRect.u32Height = 720;
-
-	// CVI_VI_SetChnCrop(0, 0, &stCropInfo);
-	// CVI_VI_SetChnCrop(1, 1, &stCropInfo);
-
-	s32Ret = SAMPLE_COMM_SYS_Init(&stVbConf);
+	s32Ret = SAMPLE_PLAT_SYS_INIT(*pstSize);
+	printf("stage PLAT_SYS_INIT ret=0x%x\n", s32Ret);
 	if (s32Ret != CVI_SUCCESS) {
 		CVI_TRACE_LOG(CVI_DBG_ERR, "sys init failed. s32Ret: 0x%x !\n", s32Ret);
 		return s32Ret;
+	}
+
+	/* Align VI/VPSS pipeline mode with known working configuration on SG2002. */
+	{
+		VI_VPSS_MODE_S stVIVPSSMode = {0};
+		VPSS_MODE_S stVPSSMode = {0};
+
+		stVIVPSSMode.aenMode[0] = VI_OFFLINE_VPSS_ONLINE;
+		stVIVPSSMode.aenMode[1] = VI_OFFLINE_VPSS_ONLINE;
+
+		stVPSSMode.enMode = VPSS_MODE_SINGLE;
+		stVPSSMode.aenInput[0] = VPSS_INPUT_ISP;
+		stVPSSMode.ViPipe[0] = 0;
+
+		s32Ret = CVI_SYS_SetVIVPSSMode(&stVIVPSSMode);
+		printf("stage SetVIVPSSMode ret=0x%x\n", s32Ret);
+		if (s32Ret != CVI_SUCCESS) {
+			CVI_TRACE_LOG(CVI_DBG_ERR, "SetVIVPSSMode failed. s32Ret: 0x%x !\n", s32Ret);
+			return s32Ret;
+		}
+
+		s32Ret = CVI_SYS_SetVPSSModeEx(&stVPSSMode);
+		printf("stage SetVPSSModeEx ret=0x%x\n", s32Ret);
+		if (s32Ret != CVI_SUCCESS) {
+			CVI_TRACE_LOG(CVI_DBG_ERR, "SetVPSSModeEx failed. s32Ret: 0x%x !\n", s32Ret);
+			return s32Ret;
+		}
 	}
 
 	/************************************************
@@ -167,6 +154,7 @@ static int32_t _CVI_Init_Vi(SIZE_S *pstSize)
 	 ************************************************/
 	if (stIniCfg.enSource == VI_PIPE_FRAME_SOURCE_DEV) {
 		s32Ret = SAMPLE_PLAT_VI_INIT(&stViConfig);
+		printf("stage PLAT_VI_INIT ret=0x%x\n", s32Ret);
 		if (s32Ret != CVI_SUCCESS) {
 			CVI_TRACE_LOG(CVI_DBG_ERR, "vi init failed. s32Ret: 0x%x !\n", s32Ret);
 			return s32Ret;
@@ -193,6 +181,11 @@ static int32_t _CVI_Init_Vi(SIZE_S *pstSize)
 
 static CVI_S32  _CVI_Init_Vpss(VI_CHN ViChn, VPSS_GRP VpssGrp, VPSS_GRP_ATTR_S *stVpssGrpAttr)
 {
+	/* Defensive cleanup: destroy any leftover group from a prior run */
+	CVI_VPSS_StopGrp(VpssGrp);
+	CVI_VPSS_DestroyGrp(VpssGrp);
+	SAMPLE_COMM_VI_UnBind_VPSS(0, ViChn, VpssGrp);
+
 	VPSS_CHN VpssChn = 0;
 	CVI_BOOL abChnEnable[VPSS_MAX_PHY_CHN_NUM] = { 0 };
 	VPSS_CHN_ATTR_S astVpssChnAttr[VPSS_MAX_PHY_CHN_NUM];
@@ -243,15 +236,59 @@ int main(int argc, char const *argv[])
     CVI_S32 s32Ret = CVI_SUCCESS;
 	SIZE_S stSize;
 	VPSS_GRP_ATTR_S stVpssGrpAttr;
+	CVI_UVC_DEVICE_CAP_S stDeviceCap = {0};
+	CVI_UVC_DATA_SOURCE_S stDataSource = {0};
+	CVI_UVC_BUFFER_CFG_S stBuffer = {0};
+	char uvc_devname[UVC_CAMERA_NUM_MAX][32] = {{0}};
 
 	UNUSED(argc);
 	UNUSED(argv);
+
+	/* Disable stdio buffering so log output appears immediately */
+	setbuf(stdout, NULL);
+	setbuf(stderr, NULL);
+
+	/* Stop default UVC server to avoid /dev/video0 ownership conflict. */
+	system("fuser -k /etc/init.d/uvc-gadget-server.elf >/dev/null 2>&1");
+
+	stDataSource.AcapHdl = 0;
+	stDataSource.VcapHdl = 0;
+	for (i = 0; i < UVC_CAMERA_NUM_MAX; i++) {
+		stDataSource.VprocHdl[i] = i;
+		stDataSource.VencHdl[i] = i;
+	}
+	stDataSource.VprocChnId = 0;
+
+	/* Open UVC device early, otherwise host may connect before userspace owns /dev/video0. */
+	if (UVC_Init(&stDeviceCap, &stDataSource, &stBuffer) != 0) {
+		printf("UVC_Init Failed !");
+		return -1;
+	}
+
+	for (i = 0; i < 50; i++) {
+		if (find_uvc_video_node(uvc_devname[0], sizeof(uvc_devname[0])) == 0) {
+			break;
+		}
+		usleep(100 * 1000);
+	}
+	if (uvc_devname[0][0] == '\0') {
+		printf("No UVC video node found!\n");
+		UVC_Deinit();
+		return -1;
+	}
+	printf("Using UVC device node: %s\n", uvc_devname[0]);
+
+	if (UVC_Start((const char *)uvc_devname) != 0) {
+		printf("UVC_Start Failed !");
+		UVC_Deinit();
+		return -1;
+	}
 
 	// start Vi
 	s32Ret = _CVI_Init_Vi(&stSize);
 	if (s32Ret != CVI_SUCCESS) {
 		printf("_CVI_Init_Vi fail, %d\n", s32Ret);
-		return -1;
+		goto EXIT_UVC;
 	}
 
 	// start Vpss
@@ -266,46 +303,10 @@ int main(int argc, char const *argv[])
 	s32Ret = _CVI_Init_Vpss(0, 0, &stVpssGrpAttr);
 	if (s32Ret != CVI_SUCCESS) {
 		SAMPLE_PRT("CVI_Init_Video_Process Grp0 failed with %d\n", s32Ret);
-		return -1;
+		goto EXIT_UVC;
 	}
 
-	s32Ret = _CVI_Init_Vpss(1, 1, &stVpssGrpAttr);
-	if (s32Ret != CVI_SUCCESS) {
-		SAMPLE_PRT("CVI_Init_Video_Process Grp0 failed with %d\n", s32Ret);
-		return -1;
-	}
-
-	CVI_VPSS_SetChnRotation(0, 0, ROTATION_270);
-	CVI_VPSS_SetChnRotation(0, 1, ROTATION_270);
-	CVI_VPSS_SetChnRotation(1, 0, ROTATION_270);
-
-	CVI_UVC_DEVICE_CAP_S stDeviceCap = {0};
-	CVI_UVC_DATA_SOURCE_S stDataSource = {0};
-	CVI_UVC_BUFFER_CFG_S stBuffer = {0};
-	stDataSource.AcapHdl = 0;
-	stDataSource.VcapHdl = 0;
-	for (i = 0; i < UVC_CAMERA_NUM_MAX; i++)
-	{
-		stDataSource.VprocHdl[i] = i;
-		stDataSource.VencHdl[i] = i;
-	}
-	stDataSource.VprocChnId = 0;
-
-    if (UVC_Init(&stDeviceCap, &stDataSource, &stBuffer) != 0) {
-        printf("UVC_Init Failed !");
-        return -1;
-    }
-
-    const char uvc_devname[UVC_CAMERA_NUM_MAX][32] = {
-		{"/dev/video0"},
-		// {"/dev/video1"},
-		{ '\0' },
-	};
-
-    if (UVC_Start((const char *)uvc_devname) != 0) {
-        printf("UVC_Start Failed !");
-        return -1;
-    }
+	/* No rotation: VPSS outputs 1280x720 landscape matching gadget configfs */
 
 	// hid_init();
 
@@ -317,4 +318,9 @@ int main(int argc, char const *argv[])
     while((0 != sem_wait(&s_ExitSem)) && (errno == EINTR));
 
     return 0;
+
+EXIT_UVC:
+	UVC_Stop();
+	UVC_Deinit();
+	return -1;
 }

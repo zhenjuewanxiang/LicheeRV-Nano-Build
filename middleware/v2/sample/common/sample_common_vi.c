@@ -467,7 +467,9 @@ CVI_S32 SAMPLE_COMM_VI_StartSensor(SAMPLE_VI_CONFIG_S *pstViConfig)
 			return s32Ret;
 		}
 	}
+	fprintf(stderr, "StartSensor: SetSensorMode\n");
 	s32Ret = SAMPLE_COMM_ISP_SetSensorMode(pstViConfig);
+	fprintf(stderr, "StartSensor: SetSensorMode ret=0x%x\n", s32Ret);
 	if (s32Ret != CVI_SUCCESS) {
 		CVI_TRACE_LOG(CVI_DBG_ERR, "sensor %d register callback failed!\n", i);
 		return s32Ret;

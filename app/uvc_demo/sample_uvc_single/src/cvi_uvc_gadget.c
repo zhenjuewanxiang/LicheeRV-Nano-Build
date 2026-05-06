@@ -147,9 +147,9 @@ struct uvc_format_info {
 
 static const struct uvc_frame_info uvc_frames_mjpeg[] = {
     {
-        720,
         1280,
-        {333333, 0},
+        720,
+        {666666, 1000000, 0},  /* 15fps, 10fps */
     },
     {
         0,
@@ -160,27 +160,13 @@ static const struct uvc_frame_info uvc_frames_mjpeg[] = {
     },
 };
 
-static const struct uvc_frame_info uvc_frames_h264[] = {
-    // {
-    //     2560,
-    //     1440,
-    //     {333333, 0},
-    // },
-    // {
-    //     1920,
-    //     1080,
-    //     {333333, 0},
-    // },
-    // {
-    //     1280,
-    //     720,
-    //     {333333, 0},
-    // },
-    // {
-    //     640,
-    //     360,
-    //     {333333, 0},
-    // },
+/* YUYV (uncompressed) — matches gadget configfs streaming/uncompressed/u/720p */
+static const struct uvc_frame_info uvc_frames_yuv[] = {
+    {
+        1280,
+        720,
+        {666666, 1000000, 0},  /* 15fps, 10fps */
+    },
     {
         0,
         0,
@@ -190,11 +176,12 @@ static const struct uvc_frame_info uvc_frames_h264[] = {
     },
 };
 
-// TODO, move into parameters
+/* Formats must match what the USB gadget advertises via configfs:
+ *   Format 1: MJPEG  1280x720 (streaming/mjpeg/m/720p)
+ *   Format 2: YUYV   1280x720 (streaming/uncompressed/u/720p) */
 static const struct uvc_format_info uvc_formats[] = {
-    // {V4L2_PIX_FMT_YUYV, uvc_frames_yuv},
-    {V4L2_PIX_FMT_MJPEG, uvc_frames_mjpeg},
-    {V4L2_PIX_FMT_H264, uvc_frames_h264},
+    {V4L2_PIX_FMT_YUYV,  uvc_frames_yuv},   /* index 1 — matches gadget uncompressed bFormatIndex=1 */
+    {V4L2_PIX_FMT_MJPEG, uvc_frames_mjpeg}, /* index 2 — matches gadget mjpeg bFormatIndex=2 */
 };
 
 /* ---------------------------------------------------------------------------
@@ -646,7 +633,7 @@ static int32_t UVC_DeviceOpen(const char *devname, UVC_DEVICE_CTX_S *dev, uint8_
     int fd;
     int ret = -EINVAL;
 
-    fd = open(devname, O_RDWR | O_NONBLOCK);
+    fd = open(devname, O_RDWR);
     if (fd == -1) {
         printf("UVC: device %s open failed: %s (%d).\n", devname, strerror(errno), errno);
         return ret;
@@ -708,28 +695,30 @@ static void UVC_VideoEnable(UVC_DEVICE_CTX_S *dev, int fd_index) {
 
 static void uvc_video_fill_buffer(UVC_DEVICE_CTX_S *dev, struct v4l2_buffer *buf, uint8_t fd_index)
 {
-    uint32_t bpl;
-    uint32_t i;
-
     uint32_t payload_size;
 
     switch (dev->fcc) {
         case V4L2_PIX_FMT_YUYV:
-            /* Fill the buffer with video data. */
-            bpl = dev->width * 2;
-            for (i = 0; i < dev->height; ++i) memset(dev->mem[fd_index][buf->index].start + i * bpl, dev->color++, bpl);
-
-            buf->bytesused = bpl * dev->height;
+            payload_size = UVC_STREAM_CopyBitStream(dev->mem[fd_index][buf->index].start, fd_index);
+            buf->bytesused = (payload_size > 0) ? (uint32_t)payload_size : dev->width * dev->height * 2;
             break;
 
         case V4L2_PIX_FMT_MJPEG:
         case V4L2_PIX_FMT_H264:
             payload_size = UVC_STREAM_CopyBitStream(dev->mem[fd_index][buf->index].start, fd_index);
-            if (payload_size < 5000) {
-                payload_size = 5000;
+            if (payload_size <= 0) {
+                /* Reuse the previous good payload to avoid high-rate empty USB submissions. */
+                if (dev->mem[fd_index][buf->index].usedBytes > 0) {
+                    buf->bytesused = (uint32_t)dev->mem[fd_index][buf->index].usedBytes;
+                } else {
+                    buf->bytesused = 0;
+                    usleep(10000);
+                }
+            } else {
+                buf->bytesused = payload_size;
+                dev->mem[fd_index][buf->index].usedBytes = payload_size;
             }
-            buf->bytesused = payload_size;
-            buf->length = payload_size;
+            buf->length = dev->mem[fd_index][buf->index].length;
             break;
     }
 }
@@ -766,6 +755,9 @@ static int uvc_video_process(UVC_DEVICE_CTX_S *dev, int fd_index) {
         /* UVC stanalone setup. */
         ret = ioctl(dev->uvc_fd[fd_index], VIDIOC_DQBUF, &ubuf);
         if (ret < 0) {
+            if (errno == EAGAIN) {
+                usleep(1000);
+            }
             return ret;
         }
 
@@ -775,6 +767,13 @@ static int uvc_video_process(UVC_DEVICE_CTX_S *dev, int fd_index) {
 #ifdef ENABLE_BUFFER_DEBUG
         printf("DeQueued buffer at UVC side = %d\n", ubuf.index);
 #endif
+
+        /* Skip QBUF if buffer is empty (no new encoded frame available).
+         * This prevents USB interrupt storms from high-frequency empty packet submissions. */
+        if (ubuf.bytesused == 0) {
+            usleep(5000);  /* Wait for next frame before retrying */
+            return ret;
+        }
 
         ret = ioctl(dev->uvc_fd[fd_index], VIDIOC_QBUF, &ubuf);
         if (ret < 0) {
@@ -807,6 +806,9 @@ static int uvc_video_process(UVC_DEVICE_CTX_S *dev, int fd_index) {
         /* Dequeue the spent buffer from UVC domain */
         ret = ioctl(dev->uvc_fd[fd_index], VIDIOC_DQBUF, &ubuf);
         if (ret < 0) {
+            if (errno == EAGAIN) {
+                usleep(1000);
+            }
             printf("UVC: Unable to dequeue buffer: %s (%d).\n", strerror(errno), errno);
             return ret;
         }
@@ -1061,23 +1063,24 @@ static int uvc_video_reqbufs_userptr(UVC_DEVICE_CTX_S *dev, int nbufs, int fd_in
                 break;
         }
 
+        uint32_t buf_size = (payload_size > MAX_BITSTREAM_BUFFER_SIZE) ? payload_size : MAX_BITSTREAM_BUFFER_SIZE;
         for (i = 0; i < rb.count; ++i) {
-            dev->dummy_buf[fd_index][i].length = MAX_BITSTREAM_BUFFER_SIZE;
-            dev->dummy_buf[fd_index][i].start = malloc(MAX_BITSTREAM_BUFFER_SIZE);
+            dev->dummy_buf[fd_index][i].length = buf_size;
+            dev->dummy_buf[fd_index][i].start = malloc(buf_size);
             if (!dev->dummy_buf[fd_index][i].start) {
                 printf("UVC: Out of memory\n");
                 ret = -ENOMEM;
                 goto err;
             }
 
-            if (V4L2_PIX_FMT_MJPEG == dev->fcc || V4L2_PIX_FMT_H264 == dev->fcc)
-                payload_size = UVC_STREAM_CopyBitStream(dev->dummy_buf[fd_index][i].start, fd_index);
-
             if (V4L2_PIX_FMT_YUYV == dev->fcc)
                 for (j = 0; j < dev->height; ++j)
                     memset(dev->dummy_buf[fd_index][i].start + j * bpl, dev->color++, bpl);
+            /* MJPEG: skip initial fill — VENC bound pipeline hasn't produced frames yet.
+             * The process loop (uvc_video_fill_buffer) will fill real frames. */
 
-            dev->dummy_buf[fd_index][i].usedBytes = payload_size;
+            dev->dummy_buf[fd_index][i].usedBytes =
+                (dev->fcc == V4L2_PIX_FMT_YUYV) ? payload_size : 0;
         }
 
         dev->mem[fd_index] = dev->dummy_buf[fd_index];
@@ -1210,10 +1213,7 @@ static void uvc_fill_streaming_control(UVC_DEVICE_CTX_S *dev, struct uvc_streami
     /* TODO: the UVC maxpayload transfer size should be filled
      * by the driver.
      */
-    if (!dev->bulk)
-        ctrl->dwMaxPayloadTransferSize = (dev->maxpkt) * (dev->mult + 1) * (dev->burst + 1);
-    else
-        ctrl->dwMaxPayloadTransferSize = ctrl->dwMaxVideoFrameSize;
+    ctrl->dwMaxPayloadTransferSize = (dev->maxpkt) * (dev->mult + 1) * (dev->burst + 1);
 
     ctrl->bmFramingInfo = 3;
     ctrl->bPreferedVersion = 1;
@@ -1475,14 +1475,16 @@ static void uvc_events_process_control(UVC_DEVICE_CTX_S *dev, uint8_t req, uint8
             break;
     }
 
-    printf("control request (req %02x cs %02x)\n", req, cs);
+    (void)req;
+    (void)cs;
 }
 
 static void uvc_events_process_streaming(UVC_DEVICE_CTX_S *dev, uint8_t req, uint8_t cs,
                                          struct uvc_request_data *resp) {
     struct uvc_streaming_control *ctrl;
 
-    printf("streaming request (req %02x cs %02x)\n", req, cs);
+    (void)req;
+    (void)cs;
 
     if (cs != UVC_VS_PROBE_CONTROL && cs != UVC_VS_COMMIT_CONTROL) return;
 
@@ -1614,7 +1616,8 @@ static int uvc_events_process_control_data(UVC_DEVICE_CTX_S *dev, uint8_t cs, ui
             break;
     }
 
-    printf("Control Request data phase (cs %02x entity %02x)\n", cs, entity_id);
+    (void)cs;
+    (void)entity_id;
 
     return 0;
 }
@@ -1643,7 +1646,7 @@ static int uvc_events_process_data(UVC_DEVICE_CTX_S *dev, struct uvc_request_dat
             break;
 
         default:
-            printf("setting unknown control, length = %d\n", data->length);
+            /* unknown controls are common on some hosts; keep quiet */
 
             /*
              * As we support only BRIGHTNESS control, this request is
@@ -1670,6 +1673,11 @@ static int uvc_events_process_data(UVC_DEVICE_CTX_S *dev, struct uvc_request_dat
     nframes = 0;
     while (format->frames[nframes].width != 0) ++nframes;
 
+    if (nframes == 0) {
+        printf("UVC: format %u has no frames, rejecting commit\n", iformat);
+        return -EINVAL;
+    }
+
     iframe = clamp((uint32_t)ctrl->bFrameIndex, 1U, nframes);
     frame = &format->frames[iframe - 1];
     interval = frame->intervals;
@@ -1684,19 +1692,23 @@ static int uvc_events_process_data(UVC_DEVICE_CTX_S *dev, struct uvc_request_dat
     switch (format->fcc) {
         case V4L2_PIX_FMT_YUYV:
             target->dwMaxVideoFrameSize = frame->width * frame->height * 2;
+            dev->imgsize = frame->width * frame->height * 2;
             break;
         case V4L2_PIX_FMT_MJPEG:
             if (dev->imgsize == 0) printf("WARNING: MJPEG requested and no image loaded.\n");
-            dev->imgsize = MJPG_PAYLOAD_SIZE;
+            dev->imgsize = MAX_BITSTREAM_BUFFER_SIZE;
             target->dwMaxVideoFrameSize = MAX_BITSTREAM_BUFFER_SIZE;
             break;
         case V4L2_PIX_FMT_H264:
             if (dev->imgsize == 0) printf("WARNING: H264 requested and no image loaded.\n");
-            dev->imgsize = H264_PAYLOAD_SIZE;
+            dev->imgsize = MAX_BITSTREAM_BUFFER_SIZE;
             target->dwMaxVideoFrameSize = MAX_BITSTREAM_BUFFER_SIZE;
             break;
     }
     target->dwFrameInterval = *interval;
+    /* Cap to 15fps for SG2002 to reduce USB IRQ pressure. */
+    if (target->dwFrameInterval < 666666)
+        target->dwFrameInterval = 666666;
 
     if (dev->control == UVC_VS_COMMIT_CONTROL) {
         dev->fcc = format->fcc;
@@ -1734,7 +1746,7 @@ static void uvc_events_process(UVC_DEVICE_CTX_S *dev, int fd_index) {
 
     switch (v4l2_event.type) {
         case UVC_EVENT_CONNECT:
-            printf("[%s]: UVC_EVENT_CONNECT\n", __func__);
+            printf("UVC_EVENT_CONNECT\n");
             return;
 
         case UVC_EVENT_DISCONNECT:
@@ -1747,25 +1759,19 @@ static void uvc_events_process(UVC_DEVICE_CTX_S *dev, int fd_index) {
             return;
 
         case UVC_EVENT_SETUP:
-            printf("xxxxxxx-----uvc_events_process_setup!!\n");
             uvc_events_process_setup(dev, &uvc_event->req, &resp);
             break;
 
         case UVC_EVENT_DATA:
-            printf("xxxxxxx-----uvc_events_process_data!!\n");
             ret = uvc_events_process_data(dev, &uvc_event->data, fd_index);
-            printf("#######-----uvc_events_process_data done!!\n");
             if (ret < 0) break;
             return;
 
         case UVC_EVENT_STREAMON:
-            printf("xxxxxxx-----uvc_handle_streamon_event!!\n");
             if (!dev->bulk) uvc_handle_streamon_event(dev, fd_index);
-            printf("#######-----uvc_handle_streamon_event done!!\n");
             return;
 
         case UVC_EVENT_STREAMOFF:
-            printf("xxxxxxx-----uvc_handle_streamoff_event!!\n");
             /* Stop V4L2 streaming... */
             if (!dev->run_standalone && dev->vdev->is_streaming) {
                 /* UVC - V4L2 integrated path. */
@@ -1795,25 +1801,9 @@ static void uvc_events_process(UVC_DEVICE_CTX_S *dev, int fd_index) {
 static void uvc_events_init(UVC_DEVICE_CTX_S *dev) {
 	uint8_t i;
     struct v4l2_event_subscription sub;
-    uint32_t payload_size = 0;
-
-    switch (dev->fcc) {
-        case V4L2_PIX_FMT_YUYV:
-            payload_size = dev->width * dev->height * 2;
-            break;
-        case V4L2_PIX_FMT_MJPEG:
-        case V4L2_PIX_FMT_H264:
-            payload_size = dev->imgsize;
-            break;
-    }
 
     uvc_fill_streaming_control(dev, &dev->probe, 0, 0);
     uvc_fill_streaming_control(dev, &dev->commit, 0, 0);
-
-    if (dev->bulk) {
-        /* FIXME Crude hack, must be negotiated with the driver. */
-        dev->probe.dwMaxPayloadTransferSize = dev->commit.dwMaxPayloadTransferSize = payload_size;
-    }
 
 	for (i = 0; i < UVC_CAMERA_NUM_MAX; i++)
 	{
@@ -1944,16 +1934,14 @@ int32_t UVC_GADGET_Init(const CVI_UVC_DEVICE_CAP_S *pstDevCaps, u_int32_t u32Max
     int default_resolution = 1; /* VGA 720p */
     int nbufs = 3;              /* Ping-Pong buffers */
     /* USB speed related params */
-    // int mult = 0;
-    int mult = 1;
+    int mult = 0;
     int burst = 0;
-    // int maxp = 768;
-    int maxp = 1024;
+    int maxp = 512;
 
     UNUSED(pstDevCaps);
     UNUSED(u32MaxFrameSize);
 
-    enum usb_device_speed speed = USB_SPEED_SUPER; /* High-Speed */
+    enum usb_device_speed speed = USB_SPEED_HIGH;
     enum io_method uvc_io_method = IO_METHOD_USERPTR;
 
     /* Set parameters as passed by user. */

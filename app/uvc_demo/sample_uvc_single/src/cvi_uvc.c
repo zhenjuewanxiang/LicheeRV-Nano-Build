@@ -48,10 +48,8 @@ static int init_vproc(int fd_index) {
     VPSS_CHN_ATTR_S stChnAttr;
 
 	CVI_VPSS_GetChnAttr(pstSrc->VprocHdl[fd_index], pstSrc->VprocChnId, &stChnAttr);
-	// stChnAttr.u32Width = pAttr->u32Width;
-	// stChnAttr.u32Height = pAttr->u32Height;
-    stChnAttr.u32Width = pAttr->u32Height;
-	stChnAttr.u32Height = pAttr->u32Width;
+    stChnAttr.u32Width  = pAttr->u32Width;
+	stChnAttr.u32Height = pAttr->u32Height;
 	CVI_VPSS_SetChnAttr(pstSrc->VprocHdl[fd_index], pstSrc->VprocChnId, &stChnAttr);
 
     return 0;
@@ -67,7 +65,7 @@ static void _initInputCfg(chnInputCfg *ipIc)
 	ipIc->bitrate = -1;
 	ipIc->firstFrmstartQp = -1;
 	ipIc->num_frames = -1;
-	ipIc->framerate = 30;
+    ipIc->framerate = 15;
 	ipIc->maxQp = -1;
 	ipIc->minQp = -1;
 	ipIc->maxIqp = -1;
@@ -113,10 +111,15 @@ static int init_venc(uint8_t fd_index) {
     // }
 
     enSize = PIC_CUSTOMIZE;
-    pIc.width = 720;
-    pIc.height = 1280;
+    pIc.width  = (int)pAttr->u32Width;
+    pIc.height = (int)pAttr->u32Height;
     pIc.quality = 60;
-    printf("[%s]enSize:%d\n", __func__, enSize);
+    printf("[%s] enSize:%d %dx%d\n", __func__, enSize, pIc.width, pIc.height);
+
+	/* Bind VPSS → VENC automatically (reference: video_imu_mux pattern) */
+	pIc.bind_mode = VENC_BIND_VPSS;
+	pIc.vpssGrp   = (int)pstSrc->VprocHdl[fd_index];
+	pIc.vpssChn   = (int)pstSrc->VprocChnId;
 
 	strcpy(pIc.codec, (enPayLoad == PT_MJPEG) ? "mjp" : (enPayLoad == PT_H264) ? "264" : "265");
 	// pIc.rcMode = (enPayLoad == PT_MJPEG) ? SAMPLE_RC_FIXQP : SAMPLE_RC_CBR;
@@ -124,21 +127,21 @@ static int init_venc(uint8_t fd_index) {
 	enRcMode = (SAMPLE_RC_E) pIc.rcMode;
 
     if(enPayLoad == PT_MJPEG){
-        pIc.iqp = 38;
-        pIc.pqp = 38;
-        pIc.gop = 60;
-        pIc.bitrate = 20000;
-        pIc.firstFrmstartQp = 26;
+        pIc.iqp = 45;
+        pIc.pqp = 45;
+        pIc.gop = 30;
+        pIc.bitrate = 4000;
+        pIc.firstFrmstartQp = 35;
         pIc.num_frames = -1;
         pIc.srcFramerate = 30;
-        pIc.framerate = 30;
-        pIc.maxQp = 42;
-        pIc.minQp = 26;
-        pIc.maxIqp = 42;
-        pIc.minIqp = 26;
+        pIc.framerate = (pAttr->u32Fps > 0 && pAttr->u32Fps <= 15) ? (int)pAttr->u32Fps : 15;
+        pIc.maxQp = 51;
+        pIc.minQp = 34;
+        pIc.maxIqp = 51;
+        pIc.minIqp = 34;
         pIc.minIprop = 1;
         pIc.maxIprop = 100;
-        pIc.initialDelay = 1000;
+        pIc.initialDelay = 500;
         pIc.bitstreamBufSize = 1024 * 1024;
     }
     else{
@@ -147,11 +150,11 @@ static int init_venc(uint8_t fd_index) {
         pIc.gop = 50;
         pIc.statTime = 2;
         pIc.s32IPQpDelta = 2;
-        pIc.bitrate = 4000;
+        pIc.bitrate = 2500;
         pIc.firstFrmstartQp = 35;
         pIc.num_frames = -1;
         pIc.srcFramerate = 30;
-        pIc.framerate = 30;
+        pIc.framerate = (pAttr->u32Fps > 0 && pAttr->u32Fps <= 20) ? (int)pAttr->u32Fps : 20;
         pIc.maxQp = 51;
         pIc.minQp = 20;
         pIc.maxIqp = 51;
@@ -164,11 +167,11 @@ static int init_venc(uint8_t fd_index) {
         pIc.initialDelay = 1000;
     }
 
-    // crop 768 to 720
-    pIc.posX = ALIGN(720, 64) - 720;
+    // crop 768 to 720: not needed for 1280x720 landscape output
+    pIc.posX = 0;
 	pIc.posY = 0;
-	pIc.width = 720;
-	pIc.height = 1280;
+	pIc.width  = (int)pAttr->u32Width;
+	pIc.height = (int)pAttr->u32Height;
 
 	s32Ret = SAMPLE_COMM_VENC_GetGopAttr(enGopMode, &stGopAttr);
 	if (s32Ret != 0) {
@@ -195,8 +198,8 @@ static int init_venc(uint8_t fd_index) {
 
 int32_t UVC_STREAM_Start(int fd_index) {
 
+    UVC_STREAM_ATTR_S *pAttr = &s_stUVCStreamCtx.stStreamAttr;
     struct timeval tv;
-    
 
     printf("UVC_STREAM_Start....\n");
     if (!s_stUVCStreamCtx.bInited[fd_index])
@@ -210,14 +213,15 @@ int32_t UVC_STREAM_Start(int fd_index) {
         gettimeofday(&tv, NULL);
         printf("init_vproc done...., timestap: %lds-%ldus\n", tv.tv_sec, tv.tv_usec);
 
-        printf("init_venc....\n");
-        if (0 != init_venc(fd_index))
-		{
-            printf("init_venc failed !");
-            return -1;
+        if (pAttr->enFormat != CVI_UVC_STREAM_FORMAT_YUV420) {
+            printf("init_venc....\n");
+            if (0 != init_venc(fd_index)) {
+                printf("init_venc failed !");
+                return -1;
+            }
+            gettimeofday(&tv, NULL);
+            printf("init_venc done...., timestap: %lds-%ldus\n", tv.tv_sec, tv.tv_usec);
         }
-        gettimeofday(&tv, NULL);
-        printf("init_venc done...., timestap: %lds-%ldus\n", tv.tv_sec, tv.tv_usec);
         s_stUVCStreamCtx.bInited[fd_index] = true;
     }
 
@@ -229,123 +233,103 @@ int32_t UVC_STREAM_Stop(int fd_index)
     if (s_stUVCStreamCtx.bInited[fd_index])
 	{
         CVI_UVC_DATA_SOURCE_S *pstSrc = &s_stUVCStreamCtx.stDataSource;
-        SAMPLE_COMM_VENC_Stop(pstSrc->VencHdl[fd_index]);
-        printf("SAMPLE_COMM_VENC_Stop %d\n", fd_index);
-
+        UVC_STREAM_ATTR_S *pStop = &s_stUVCStreamCtx.stStreamAttr;
+        if (pStop->enFormat != CVI_UVC_STREAM_FORMAT_YUV420) {
+            /* Unbind VPSS->VENC before destroying channel */
+            SAMPLE_COMM_VPSS_UnBind_VENC((VPSS_GRP)pstSrc->VprocHdl[fd_index],
+                                         (VPSS_CHN)pstSrc->VprocChnId,
+                                         (VENC_CHN)pstSrc->VencHdl[fd_index]);
+            SAMPLE_COMM_VENC_Stop(pstSrc->VencHdl[fd_index]);
+            printf("SAMPLE_COMM_VENC_Stop %d\n", fd_index);
+        }
         s_stUVCStreamCtx.bInited[fd_index] = false;
     }
     return 0;
 }
 
+/* Pull one encoded frame from the VENC bound pipeline and copy it into dst.
+ * Uses QueryStatus (non-blocking) — same pattern as video_imu_mux send_mjpeg_to_uvc.
+ * Returns byte count on success, 0 if no frame is ready yet. */
 int32_t UVC_STREAM_CopyBitStream(void *dst, uint8_t fd_index) {
-    int32_t s32Ret = 0;
+    UVC_STREAM_ATTR_S *pAttr = &s_stUVCStreamCtx.stStreamAttr;
     CVI_UVC_DATA_SOURCE_S *pstSrc = &s_stUVCStreamCtx.stDataSource;
-    VIDEO_FRAME_INFO_S venc_frame;
-    VENC_STREAM_S stStream = {0};
 
-    // VIDEO_FRAME_INFO_S vpss_frame1, vpss_frame2;
-    // s32Ret = CVI_VPSS_GetChnFrame(0, 1, &vpss_frame1, -1);
-    // if (s32Ret != 0) {
-    //     printf("CVI_VPSS_GetChnFrame1 failed! %d\n", s32Ret);
-    //     return -1;
-    // }
+    if (pAttr->enFormat == CVI_UVC_STREAM_FORMAT_YUV420) {
+        /* YUYV path: get raw VPSS frame, convert NV21 -> YUYV */
+        VIDEO_FRAME_INFO_S stFrame;
+        memset(&stFrame, 0, sizeof(stFrame));
+        if (CVI_VPSS_GetChnFrame((VPSS_GRP)pstSrc->VprocHdl[fd_index],
+                                 (VPSS_CHN)pstSrc->VprocChnId,
+                                 &stFrame, 0) != CVI_SUCCESS)
+            return 0;
 
-    // s32Ret = CVI_VPSS_GetChnFrame(1, 0, &vpss_frame2, -1);
-    // if (s32Ret != 0) {
-    //     printf("CVI_VPSS_GetChnFrame2 failed! %d\n", s32Ret);
-    //     return -1;
-    // }
+        VIDEO_FRAME_S *f = &stFrame.stVFrame;
+        uint32_t W = f->u32Width;
+        uint32_t H = f->u32Height;
+        uint32_t strideY  = f->u32Stride[0];
+        uint32_t strideVU = f->u32Stride[1];
+        int32_t  ret = 0;
 
-    s32Ret = CVI_VPSS_GetChnFrame(pstSrc->VprocHdl[fd_index], pstSrc->VprocChnId, &venc_frame, -1);
-    if (s32Ret != 0) {
-        printf("CVI_VPSS_GetChnFrame failed! %d\n", s32Ret);
-        return -1;
+        uint8_t *Y  = (uint8_t *)CVI_SYS_Mmap(f->u64PhyAddr[0], f->u32Length[0]);
+        uint8_t *VU = (uint8_t *)CVI_SYS_Mmap(f->u64PhyAddr[1], f->u32Length[1]);
+
+        if (Y && VU) {
+            uint8_t *out = (uint8_t *)dst;
+            uint32_t row, col;
+            for (row = 0; row < H; row++) {
+                uint8_t *yRow  = Y  + row * strideY;
+                uint8_t *vuRow = VU + (row / 2) * strideVU;
+                for (col = 0; col < W; col += 2) {
+                    /* NV21: V at even col, U at odd; YUYV: Y0 U Y1 V */
+                    out[0] = yRow[col];
+                    out[1] = vuRow[col + 1]; /* U */
+                    out[2] = yRow[col + 1];
+                    out[3] = vuRow[col];     /* V */
+                    out += 4;
+                }
+            }
+            ret = (int32_t)(W * H * 2);
+        }
+
+        if (Y)  CVI_SYS_Munmap(Y,  f->u32Length[0]);
+        if (VU) CVI_SYS_Munmap(VU, f->u32Length[1]);
+        CVI_VPSS_ReleaseChnFrame((VPSS_GRP)pstSrc->VprocHdl[fd_index],
+                                 (VPSS_CHN)pstSrc->VprocChnId, &stFrame);
+        return ret;
     }
 
-    int32_t s32SetFrameMilliSec = 20000;
-    VENC_CHN_ATTR_S stVencChnAttr;
-    VENC_CHN_STATUS_S stStat;
+    /* MJPEG/H264 path: pull encoded frame from VENC */
+    VENC_CHN_STATUS_S stStat   = {0};
+    VENC_STREAM_S     stStream = {0};
+    uint32_t bitstream_size = 0;
+    unsigned i;
 
-    s32Ret = CVI_VENC_SendFrame(pstSrc->VencHdl[fd_index], &venc_frame, s32SetFrameMilliSec);
-    if (s32Ret != 0) {
-        printf("CVI_VENC_SendFrame failed! %d\n", s32Ret);
-        return -1;
-    }
-
-    s32Ret = CVI_VENC_GetChnAttr(pstSrc->VencHdl[fd_index], &stVencChnAttr);
-    if (s32Ret != 0) {
-        printf("CVI_VENC_GetChnAttr, VencChn[%d], s32Ret = %d\n", pstSrc->VprocHdl[fd_index], s32Ret);
-        return -1;
-    }
-
-    s32Ret = CVI_VENC_QueryStatus(pstSrc->VencHdl[fd_index], &stStat);
-    if (s32Ret != 0) {
-        printf("CVI_VENC_QueryStatus failed with %#x!\n", s32Ret);
-        return -1;
-    }
-
-    if (!stStat.u32CurPacks) {
-        printf("NOTE: Current frame is NULL!\n");
-        return -1;
-    }
+    /* Non-blocking: return immediately if no frame is ready */
+    if (CVI_VENC_QueryStatus(pstSrc->VencHdl[fd_index], &stStat) != CVI_SUCCESS ||
+        stStat.u32CurPacks == 0)
+        return 0;
 
     stStream.pstPack = (VENC_PACK_S *)malloc(sizeof(VENC_PACK_S) * stStat.u32CurPacks);
-    if (stStream.pstPack == NULL) {
-        printf("malloc memory failed!\n");
-        return -1;
-    }
+    if (!stStream.pstPack)
+        return 0;
 
-    s32Ret = CVI_VENC_GetStream(pstSrc->VencHdl[fd_index], &stStream, -1);
-    if (s32Ret != 0) {
-        printf("CVI_VENC_GetStream failed with %#x!\n", s32Ret);
+    if (CVI_VENC_GetStream(pstSrc->VencHdl[fd_index], &stStream, 0) != CVI_SUCCESS) {
         free(stStream.pstPack);
-        stStream.pstPack = NULL;
-        return -1;
+        return 0;
     }
 
-    uint32_t bitstream_size = 0;
-    for (unsigned i = 0; i < stStream.u32PackCount; i++) {
-        VENC_PACK_S *ppack;
-        ppack = &stStream.pstPack[i];
-
-        memcpy(dst + bitstream_size, ppack->pu8Addr + ppack->u32Offset, ppack->u32Len - ppack->u32Offset);
-        bitstream_size += ppack->u32Len - ppack->u32Offset;
+    for (i = 0; i < stStream.u32PackCount; i++) {
+        VENC_PACK_S *p   = &stStream.pstPack[i];
+        uint32_t    len  = (p->u32Len > p->u32Offset) ? (p->u32Len - p->u32Offset) : 0;
+        if (len > 0 && bitstream_size + len <= (1 * 1024 * 1024)) {
+            memcpy((uint8_t *)dst + bitstream_size, p->pu8Addr + p->u32Offset, len);
+            bitstream_size += len;
+        }
     }
 
-    s32Ret = CVI_VENC_ReleaseStream(pstSrc->VencHdl[fd_index], &stStream);
-    if (s32Ret != 0) {
-        printf("CVI_VENC_ReleaseStream, s32Ret = %d\n", s32Ret);
-        free(stStream.pstPack);
-        stStream.pstPack = NULL;
-        return -1;
-    }
-
+    CVI_VENC_ReleaseStream(pstSrc->VencHdl[fd_index], &stStream);
     free(stStream.pstPack);
-    stStream.pstPack = NULL;
-
-    CVI_VPSS_ReleaseChnFrame(pstSrc->VprocHdl[fd_index], pstSrc->VprocChnId, &venc_frame);
-
-    // int i;
-    // int count = 0;
-    // for (i = 0; i < 2; i++) {
-    //     vpss_frame1.stVFrame.pu8VirAddr[i] = (CVI_U8*)CVI_SYS_Mmap(vpss_frame1.stVFrame.u64PhyAddr[i], vpss_frame1.stVFrame.u32Length[i]);
-    //     memcpy(&dataptr[count], vpss_frame1.stVFrame.pu8VirAddr[i], vpss_frame1.stVFrame.u32Length[i]);
-    //     count = count + vpss_frame1.stVFrame.u32Length[i];
-    //     CVI_SYS_Munmap(vpss_frame1.stVFrame.pu8VirAddr[i], vpss_frame1.stVFrame.u32Length[i]);
-    // }
-
-    // count = 0;
-    // for (i = 0; i < 2; i++) {
-    //     vpss_frame2.stVFrame.pu8VirAddr[i] = (CVI_U8*)CVI_SYS_Mmap(vpss_frame2.stVFrame.u64PhyAddr[i], vpss_frame2.stVFrame.u32Length[i]);
-    //     memcpy(&dataptr[count], vpss_frame2.stVFrame.pu8VirAddr[i], vpss_frame2.stVFrame.u32Length[i]);
-    //     count = count + vpss_frame2.stVFrame.u32Length[i];
-    //     CVI_SYS_Munmap(vpss_frame2.stVFrame.pu8VirAddr[i], vpss_frame2.stVFrame.u32Length[i]);
-    // }
-
-    // CVI_VPSS_ReleaseChnFrame(0, 1, &vpss_frame1);
-    // CVI_VPSS_ReleaseChnFrame(1, 0, &vpss_frame2);
-
-    return bitstream_size;
+    return (int32_t)bitstream_size;
 }
 
 int32_t UVC_STREAM_ReqIDR(void) {
@@ -371,7 +355,6 @@ static void *UVC_CheckTask(void *pvArg) {
             printf("UVC_GADGET_DeviceCheck %x\n", ret);
             break;
         } else if (ret == 0) {
-            printf("Timeout Do Nothing\n");
             if (false != g_bPushVencData) {
                 g_bPushVencData = false;
             }
@@ -390,14 +373,6 @@ static int32_t UVC_LoadMod(void) {
     first = false;
     printf("Uvc insmod ko successfully!");
     // cvi_insmod(CVI_KOMOD_PATH"/videobuf2-memops.ko", NULL);
-    cvi_system("echo 449 >/sys/class/gpio/export");
-    cvi_system("echo 450 >/sys/class/gpio/export");
-
-    cvi_system("echo \"out\" >/sys/class/gpio/gpio449/direction");
-    cvi_system("echo \"out\" >/sys/class/gpio/gpio450/direction");
-
-    cvi_system("echo 0 >/sys/class/gpio/gpio449/value");
-    cvi_system("echo 1 >/sys/class/gpio/gpio450/value");
 
     cvi_insmod(CVI_KOMOD_PATH"/usbcore.ko", NULL);
     cvi_insmod(CVI_KOMOD_PATH"/dwc2.ko", NULL);
@@ -408,10 +383,12 @@ static int32_t UVC_LoadMod(void) {
     cvi_insmod(CVI_KOMOD_PATH"/u_audio.ko", NULL);
     cvi_insmod(CVI_KOMOD_PATH"/usb_f_uac1.ko", NULL);
     cvi_system("echo device > /proc/cviusb/otg_role");
-    cvi_system(CVI_UVC_SCRIPTS_PATH"/run_usb.sh probe uvc");
-    // cvi_system(CVI_UVC_SCRIPTS_PATH"/run_usb.sh probe hid");
-    cvi_system("./ConfigUVC.sh");
-    cvi_system(CVI_UVC_SCRIPTS_PATH"/run_usb.sh start");
+
+    if (access("/etc/init.d/uvc_tool.sh", X_OK) == 0) {
+        /* Recover stale configfs state: if no video node exists, rebuild the UVC gadget function. */
+        cvi_system("if ! ls /sys/class/video4linux/video* >/dev/null 2>&1; then /etc/init.d/uvc_tool.sh unmount >/dev/null 2>&1; /etc/init.d/uvc_tool.sh mount /boot/usb.uvc; fi");
+    }
+
     cvi_system("devmem 0x030001DC 32 0x8844");
     return 0;
 }
@@ -466,17 +443,24 @@ int32_t UVC_Start(const char *pDevPath)
 
     if (false == s_stUVCCtx.bRun) {
 
-		for (i = 0; i < UVC_CAMERA_NUM_MAX; i++)
+        for (i = 0; i < UVC_CAMERA_NUM_MAX; i++)
 		{
+            int retry;
 			if (*devpath == '\0')
 				break;
 
 			strcpy(s_stUVCCtx.szDevPath, devpath);
 
-			if (UVC_GADGET_DeviceOpen(devpath, i)) {
-				printf("UVC_GADGET_DeviceOpen Failed!");
-				return -1;
-			}
+            for (retry = 0; retry < 50; retry++) {
+                if (UVC_GADGET_DeviceOpen(devpath, i) == 0) {
+                    break;
+                }
+                usleep(100 * 1000);
+            }
+            if (retry == 50) {
+                printf("UVC_GADGET_DeviceOpen Failed!\n");
+                return -1;
+            }
 			devpath += 32;
             dev_num += 1;
 		}

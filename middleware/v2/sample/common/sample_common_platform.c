@@ -101,13 +101,21 @@ CVI_S32 SAMPLE_PLAT_VI_INIT(SAMPLE_VI_CONFIG_S *pstViConfig)
 	/************************************************
 	 * step1:  Get input size
 	 ************************************************/
+	printf("PLAT_VI: s32WorkingViNum=%d snsType=%d\n",
+	       pstViConfig->s32WorkingViNum,
+	       pstViConfig->astViInfo[0].stSnsInfo.enSnsType);
+	fflush(stdout);
 	s32Ret = SAMPLE_COMM_VI_GetSizeBySensor(pstViConfig->astViInfo[ViDev].stSnsInfo.enSnsType, &enPicSize);
+	printf("PLAT_VI: GetSizeBySensor ret=0x%x enPicSize=%d\n", s32Ret, enPicSize);
+	fflush(stdout);
 	if (s32Ret != CVI_SUCCESS) {
 		CVI_TRACE_LOG(CVI_DBG_ERR, "SAMPLE_COMM_VI_GetSizeBySensor failed with %#x\n", s32Ret);
 		goto error;
 	}
 
 	s32Ret = SAMPLE_COMM_SYS_GetPicSize(enPicSize, &stSize);
+	printf("PLAT_VI: GetPicSize ret=0x%x %ux%u\n", s32Ret, stSize.u32Width, stSize.u32Height);
+	fflush(stdout);
 	if (s32Ret != CVI_SUCCESS) {
 		CVI_TRACE_LOG(CVI_DBG_ERR, "SAMPLE_COMM_SYS_GetPicSize failed with %#x\n", s32Ret);
 		goto error;
@@ -117,8 +125,11 @@ CVI_S32 SAMPLE_PLAT_VI_INIT(SAMPLE_VI_CONFIG_S *pstViConfig)
 	/************************************************
 	 * step2:  Init VI ISP
 	 ************************************************/
+	fprintf(stderr, "PLAT_VI: entering StartDev loop, WorkingViNum=%d\n", pstViConfig->s32WorkingViNum);
 #if USE_USER_SEN_DRIVER
+	fprintf(stderr, "PLAT_VI: calling StartSensor (USE_USER_SEN_DRIVER=1)\n");
 	s32Ret = SAMPLE_COMM_VI_StartSensor(pstViConfig);
+	fprintf(stderr, "PLAT_VI: StartSensor ret=0x%x\n", s32Ret);
 	if (s32Ret != CVI_SUCCESS) {
 		CVI_TRACE_LOG(CVI_DBG_ERR, "system start sensor failed with %#x\n", s32Ret);
 		goto error;
@@ -127,7 +138,9 @@ CVI_S32 SAMPLE_PLAT_VI_INIT(SAMPLE_VI_CONFIG_S *pstViConfig)
 	for (i = 0; i < pstViConfig->s32WorkingViNum; i++) {
 		ViDev = i;
 
+		fprintf(stderr, "PLAT_VI: StartDev[%d]\n", ViDev);
 		s32Ret = SAMPLE_COMM_VI_StartDev(&pstViConfig->astViInfo[ViDev]);
+		fprintf(stderr, "PLAT_VI: StartDev[%d] ret=0x%x\n", ViDev, s32Ret);
 		if (s32Ret != CVI_SUCCESS) {
 			CVI_TRACE_LOG(CVI_DBG_ERR, "VI_StartDev failed with %#x!\n", s32Ret);
 			goto error;
@@ -171,13 +184,21 @@ CVI_S32 SAMPLE_PLAT_VI_INIT(SAMPLE_VI_CONFIG_S *pstViConfig)
 		for (j = 0; j < WDR_MAX_PIPE_NUM; j++) {
 			if (pstViInfo->stPipeInfo.aPipe[j] >= 0 && pstViInfo->stPipeInfo.aPipe[j] < VI_MAX_PIPE_NUM) {
 				ViPipe = pstViInfo->stPipeInfo.aPipe[j];
-				s32Ret = CVI_VI_CreatePipe(ViPipe, &stPipeAttr);
+				printf("PLAT_VI: CreatePipe[%d]\n", ViPipe);
+			fflush(stdout);
+			s32Ret = CVI_VI_CreatePipe(ViPipe, &stPipeAttr);
+			printf("PLAT_VI: CreatePipe[%d] ret=0x%x\n", ViPipe, s32Ret);
+			fflush(stdout);
 				if (s32Ret != CVI_SUCCESS) {
 					CVI_TRACE_LOG(CVI_DBG_ERR, "CVI_VI_CreatePipe failed with %#x!\n", s32Ret);
 					goto error;
 				}
 
-				s32Ret = CVI_VI_StartPipe(ViPipe);
+				printf("PLAT_VI: StartPipe[%d]\n", ViPipe);
+			fflush(stdout);
+			s32Ret = CVI_VI_StartPipe(ViPipe);
+			printf("PLAT_VI: StartPipe[%d] ret=0x%x\n", ViPipe, s32Ret);
+			fflush(stdout);
 				if (s32Ret != CVI_SUCCESS) {
 					CVI_TRACE_LOG(CVI_DBG_ERR, "CVI_VI_StartPipe failed with %#x!\n", s32Ret);
 					goto error;
@@ -192,13 +213,23 @@ CVI_S32 SAMPLE_PLAT_VI_INIT(SAMPLE_VI_CONFIG_S *pstViConfig)
 		}
 	}
 
+	printf("PLAT_VI: CreateIsp\n");
+	fflush(stdout);
+	fprintf(stderr, "PLAT_VI: CreateIsp\n");
 	s32Ret = SAMPLE_COMM_VI_CreateIsp(pstViConfig);
+	printf("PLAT_VI: CreateIsp ret=0x%x\n", s32Ret);
+	fflush(stdout);
+	fprintf(stderr, "PLAT_VI: CreateIsp ret=0x%x\n", s32Ret);
 	if (s32Ret != CVI_SUCCESS) {
 		CVI_TRACE_LOG(CVI_DBG_ERR, "VI_CreateIsp failed with %#x!\n", s32Ret);
 		goto error;
 	}
 
+	printf("PLAT_VI: StartViChn\n");
+	fflush(stdout);
 	s32Ret = SAMPLE_COMM_VI_StartViChn(pstViConfig);
+	printf("PLAT_VI: StartViChn ret=0x%x\n", s32Ret);
+	fflush(stdout);
 	if (s32Ret != CVI_SUCCESS) {
 		CVI_TRACE_LOG(CVI_DBG_ERR, "VI_StartViChn failed with %#x!\n", s32Ret);
 		goto error;
